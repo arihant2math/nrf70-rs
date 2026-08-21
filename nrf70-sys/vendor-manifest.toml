@@ -1,0 +1,55 @@
+schema = 1
+target = "thumbv8m.main-none-eabihf"
+cpu = "cortex-m33"
+float_abi = "hard"
+enum_width = "32-bit (-fno-short-enums)"
+clang = "21.0.0"
+
+[nrf70_bm]
+url = "https://github.com/nrfconnect/nrf70-bm.git"
+commit = "185ec021afb61dc2d42b4f65800c3aa3d27c88d6"
+license = "BSD-3-Clause (per-file SPDX)"
+
+[nrf_wifi]
+url = "https://github.com/zephyrproject-rtos/nrf_wifi.git"
+commit = "0aaa9aa812877cb6bc020df8260d0607a3f0ec1a"
+license = "BSD-3-Clause (selected source files)"
+
+[hostap]
+url = "https://github.com/zephyrproject-rtos/hostap.git"
+commit = "d467a115b8fc20b8b7120937cb1d445dacebc6a1"
+license = "BSD-3-Clause (project COPYING; per-file 'terms of the BSD license' notices, checked at build time)"
+subset = "STA-only WPA2-Personal supplicant: rsn_supp/{wpa,wpa_ie,pmksa_cache}, common/{wpa_common,ieee802_11_common}, utils/{common,wpabuf}, crypto/{sha1*,sha256*,aes-internal*,aes-unwrap,aes-omac1}"
+compile_defines = ["CONFIG_NO_STDOUT_DEBUG", "CONFIG_NO_WPA_MSG", "CONFIG_NO_HOSTAPD_LOGGER", "CONFIG_NO_RANDOM_POOL", "CONFIG_NO_RC4", "CONFIG_NO_TKIP", "CONFIG_CRYPTO_INTERNAL", "CONFIG_FIPS"]
+archive = "nrf70_supplicant (second cc archive; libc calls interposed to nrf70_os_*)"
+
+[nrfxlib]
+url = "https://github.com/nrfconnect/sdk-nrfxlib.git"
+commit = "f1591c62b301c2dc8d91308d43903de563f64d81"
+license_file = "third_party/nrf70-bm/sdk-nrfxlib/LICENSE"
+
+[firmware]
+path = "sdk-nrfxlib/nrf_wifi/bin/zephyr/default/nrf70.bin"
+version = "1.2.14.9"
+sha256 = "36b84d10037a9609a2a0fe86a0ef5b53fcd5fc2e88621c6d8f0f711b76775b1e"
+license = "LicenseRef-Nordic-5-Clause"
+
+[configuration]
+mode = "system (STA data plane)"
+compile_defines = ["NRF70_STA_MODE=1", "NRF70_DATA_TX=1"]
+physical_bus = "SPI through OSAL QSPI-shaped operations"
+board_power_ceilings = "nRF7002 EK/EB development hardware only; replace with measured custom-board values before production"
+operating_band = "5 GHz"
+low_power = true
+control_arena_bytes_recommended = 131072
+ssid_slots = 2
+manual_channel_slots = 32
+event_tasklet_slice = 1 # checked restartable patch to hal_api_common.c
+event_fetch_slice = 1   # checked restartable patch to hal_interrupt.c
+open_auth_bssid_patch = true # checked patch to pinned fmac_api.c; upstream omits the valid bit
+tx_tokens = 5
+tx_pending_queue = 8
+rx_buffers = 3
+rx_buffer_bytes = 1600
+facade_rx_queue = 4
+ethernet_frame_bytes = 1514
