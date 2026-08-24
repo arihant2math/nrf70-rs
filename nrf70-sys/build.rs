@@ -406,6 +406,10 @@ fn main() {
     let mut supplicant_build: Option<cc::Build> = None;
     build
         .compiler("clang")
+        // The pinned Nordic sources contain numerous benign warnings. Since
+        // cc forwards every diagnostic as a Cargo warning (and Cargo replays
+        // them on cached builds), keep them from flooding MCU build output.
+        .warnings(false)
         .include("include")
         .flag("-std=c11")
         .flag("-fno-short-enums");
@@ -495,6 +499,8 @@ fn main() {
         }
         let mut supp = cc::Build::new();
         supp.compiler("clang")
+            // hostap's disabled-feature stubs are intentionally warning-heavy.
+            .warnings(false)
             .flag("-std=c11")
             .flag("-fno-short-enums");
         apply_arm_flags(&mut supp);
