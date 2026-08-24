@@ -13,6 +13,9 @@ default = []
 # Host-only deterministic backend for unit tests. Production builds must not enable this.
 mock = []
 
+[dependencies]
+num_enum = { version = "0.7", default-features = false }
+
 [build-dependencies]
 bindgen = "0.72"
 cc = "1.2"

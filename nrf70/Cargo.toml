@@ -21,6 +21,3 @@ embedded-hal = "1.0"
 heapless = "0.9"
 nrf70-sys = { path = "../nrf70-sys" }
 zeroize = { version = "1", default-features = false }
-
-[dev-dependencies]
-futures = "0.3"

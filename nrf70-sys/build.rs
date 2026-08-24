@@ -148,6 +148,15 @@ const HOSTAP_SHIM_HEADERS: &[(&str, &str)] = &[
     ("arpa/inet.h", "#pragma once\n"),
 ];
 
+/// libc symbols the nrf_wifi sources reference, interposed to nrf70_os_* (the
+/// definitions live in facade.c). These are `-D` renames for the cc build only;
+/// bindgen must never see them, or the facade header's own declarations would
+/// be rewritten too.
+const NRF_WIFI_LIBC_INTERPOSERS: &[&str] = &[
+    "malloc", "calloc", "free", "memcpy", "memset", "memcmp", "strlen", "strcmp", "printf",
+    "snprintf",
+];
+
 const INCLUDES: &[&str] = &[
     "nrf70_bm_lib/include",
     "nrf_wifi",
@@ -197,6 +206,109 @@ const ZERO_DEFINES: &[&str] = &[
     "CONFIG_NRF70_BAND_UNII_4_UPPER_EDGE_BACKOFF_HE",
 ];
 
+/// The five flags bindgen's libclang invocation needs to agree with the cc
+/// build about the target's type layout.
+const ARM_TARGET: &[&str] = &[
+    "--target=arm-none-eabi",
+    "-mcpu=cortex-m33",
+    "-mthumb",
+    "-mfloat-abi=hard",
+    "-mfpu=fpv5-sp-d16",
+];
+/// Codegen flags that apply to the C compilations only.
+const ARM_CODEGEN: &[&str] = &[
+    "-ffunction-sections",
+    "-fdata-sections",
+    "-fno-strict-aliasing",
+    "-fno-builtin",
+    "-ffreestanding",
+];
+
+/// In-tree edits to pinned vendor sources. Each is applied to a copy written
+/// into OUT_DIR; `edits` are `replacen(.., 1)` in order (order is load-bearing
+/// for hal_api_common.c), and `marker` must survive or the pin has drifted.
+struct Patch {
+    source: &'static str,
+    out_name: &'static str,
+    edits: &'static [(&'static str, &'static str)],
+    marker: &'static str,
+    panic_msg: &'static str,
+}
+
+const PATCHES: &[Patch] = &[
+    Patch {
+        source: "nrf_wifi/fw_if/umac_if/src/system/fmac_api.c",
+        out_name: "fmac_api_open_bssid.c",
+        edits: &[(
+            "\tif (auth_info->ssid.nrf_wifi_ssid_len > 0) {\n\t\tauth_cmd->valid_fields |= NRF_WIFI_CMD_AUTHENTICATE_SSID_VALID;\n\t}\n",
+            "\tif (auth_info->ssid.nrf_wifi_ssid_len > 0) {\n\t\tauth_cmd->valid_fields |= NRF_WIFI_CMD_AUTHENTICATE_SSID_VALID;\n\t}\n\n\tif (!nrf_wifi_util_is_arr_zero(auth_info->nrf_wifi_bssid,\n\t\t\t\t       sizeof(auth_info->nrf_wifi_bssid))) {\n\t\tauth_cmd->valid_fields |= NRF_WIFI_CMD_AUTHENTICATE_BSSID_VALID;\n\t}\n",
+        )],
+        marker: "auth_cmd->valid_fields |= NRF_WIFI_CMD_AUTHENTICATE_BSSID_VALID",
+        panic_msg: "pinned open-auth BSSID patch no longer applies",
+    },
+    Patch {
+        source: "nrf_wifi/hw_if/hal/src/common/hal_api_common.c",
+        out_name: "hal_api_common_bounded.c",
+        edits: &[
+            (
+                "unsigned int event_len = 0;\n\n\twhile (1) {",
+                "unsigned int event_len = 0;\n\tunsigned int facade_events_processed = 0;\n\n\twhile (facade_events_processed < 1) {",
+            ),
+            (
+                "nrf_wifi_osal_mem_free(event);\n\t\tevent = NULL;\n\t}\n\nout:",
+                "nrf_wifi_osal_mem_free(event);\n\t\tevent = NULL;\n\t\tfacade_events_processed++;\n\t}\n\tif (facade_events_processed == 1) {\n\t\tnrf_wifi_osal_tasklet_schedule(hal_dev_ctx->event_tasklet);\n\t}\n\nout:",
+            ),
+        ],
+        marker: "facade_events_processed",
+        panic_msg: "pinned event-budget patch no longer applies",
+    },
+    Patch {
+        source: "nrf_wifi/hw_if/hal/src/common/hal_interrupt.c",
+        out_name: "hal_interrupt_bounded.c",
+        edits: &[
+            (
+                "unsigned int event_addr = 0;\n\n\twhile (1) {",
+                "unsigned int event_addr = 0;\n\tunsigned int facade_events_fetched = 0;\n\n\twhile (facade_events_fetched < 1) {",
+            ),
+            (
+                "\t\tnum_events++;\n\t}\n\nout:",
+                "\t\tnum_events++;\n\t\tfacade_events_fetched++;\n\t}\n\nout:",
+            ),
+        ],
+        marker: "facade_events_fetched",
+        panic_msg: "pinned IRQ-budget patch no longer applies",
+    },
+];
+
+fn apply_arm_flags(build: &mut cc::Build) {
+    for flag in ARM_TARGET.iter().chain(ARM_CODEGEN) {
+        build.flag(flag);
+    }
+}
+/// Resolves an LLVM binary shipped in the rustc sysroot for the host triple.
+fn llvm_tool(name: &str) -> PathBuf {
+    let sysroot = Command::new(env::var("RUSTC").unwrap_or_else(|_| "rustc".into()))
+        .args(["--print", "sysroot"])
+        .output()
+        .expect("rustc sysroot");
+    PathBuf::from(String::from_utf8(sysroot.stdout).unwrap().trim()).join(format!(
+        "lib/rustlib/{}/bin/{name}",
+        env::var("HOST").unwrap()
+    ))
+}
+/// Resolves one pinned vendor source, checking it exists and still carries its
+/// license notice, and registers it for rebuild tracking.
+fn vendored(root: &Path, rel: &str, notice: &str, absent_msg: &str, notice_msg: &str) -> PathBuf {
+    let p = root.join(rel);
+    if !p.is_file() {
+        panic!("{absent_msg}: {}", p.display())
+    }
+    if !fs::read_to_string(&p).unwrap_or_default().contains(notice) {
+        panic!("{notice_msg}: {}", p.display())
+    }
+    println!("cargo:rerun-if-changed={}", p.display());
+    p
+}
 fn hash(path: &Path) -> String {
     format!(
         "{:x}",
@@ -217,71 +329,59 @@ fn require_revision(path: &Path, expected: &str) {
         );
     }
 }
-fn define_args(firmware: &Path) -> Vec<(String, Option<String>)> {
+fn define_args(firmware: &Path) -> Vec<(String, String)> {
     let mut d = vec![
-        ("NRF70_STA_MODE".into(), Some("1".into())),
+        ("NRF70_STA_MODE".into(), "1".into()),
         // The op-mode gate in fmac_api_common.c needs exactly one of
         // NRF70_SCAN_ONLY / NRF70_SYSTEM_MODE / NRF70_SYSTEM_WITH_RAW_MODES;
         // this must match the embedded blob's feature flag (default = system).
-        ("NRF70_SYSTEM_MODE".into(), Some("1".into())),
-        ("NRF70_DATA_TX".into(), Some("1".into())),
-        ("CONFIG_NRF70_BOARD_TYPE_EK".into(), Some("1".into())),
-        ("CONFIG_NRF70_BM_LOG_LEVEL".into(), Some("0".into())),
-        ("CONFIG_NRF70_SCAN_SSID_FILT_MAX".into(), Some("2".into())),
-        (
-            "CONFIG_NRF70_SCAN_CHAN_MAX_MANUAL".into(),
-            Some("32".into()),
-        ),
-        ("CONFIG_NRF_WIFI_SCAN_MAX_BSS_CNT".into(), Some("64".into())),
-        ("CONFIG_NRF70_OTP_MAC_ADDRESS".into(), Some("1".into())),
-        ("CONFIG_NRF_WIFI_LOW_POWER".into(), Some("1".into())),
-        ("NRF_WIFI_LOW_POWER".into(), Some("1".into())),
-        ("CONFIG_NRF_WIFI_BEAMFORMING".into(), Some("1".into())),
-        ("CONFIG_NRF_WIFI_OP_BAND".into(), Some("2".into())),
-        ("NRF_WIFI_MAX_PS_POLL_FAIL_CNT".into(), Some("10".into())),
+        ("NRF70_SYSTEM_MODE".into(), "1".into()),
+        ("NRF70_DATA_TX".into(), "1".into()),
+        ("CONFIG_NRF70_BOARD_TYPE_EK".into(), "1".into()),
+        ("CONFIG_NRF70_BM_LOG_LEVEL".into(), "0".into()),
+        ("CONFIG_NRF70_SCAN_SSID_FILT_MAX".into(), "2".into()),
+        ("CONFIG_NRF70_SCAN_CHAN_MAX_MANUAL".into(), "32".into()),
+        ("CONFIG_NRF_WIFI_SCAN_MAX_BSS_CNT".into(), "64".into()),
+        ("CONFIG_NRF70_OTP_MAC_ADDRESS".into(), "1".into()),
+        ("CONFIG_NRF_WIFI_LOW_POWER".into(), "1".into()),
+        ("NRF_WIFI_LOW_POWER".into(), "1".into()),
+        ("CONFIG_NRF_WIFI_BEAMFORMING".into(), "1".into()),
+        ("CONFIG_NRF_WIFI_OP_BAND".into(), "2".into()),
+        ("NRF_WIFI_MAX_PS_POLL_FAIL_CNT".into(), "10".into()),
         // Total RX buffers across all MAX_NUM_OF_RX_QUEUES pools (the HAL
         // sizes its PKTRAM reservation from this); must divide evenly by 3.
-        ("NRF70_RX_NUM_BUFS".into(), Some("6".into())),
-        ("NRF70_RX_MAX_DATA_SIZE".into(), Some("1600".into())),
-        ("NRF70_MAX_TX_TOKENS".into(), Some("5".into())),
-        ("NRF70_MAX_TX_PENDING_QLEN".into(), Some("8".into())),
-        ("NRF70_PATCH_DL_CHUNK_SIZE".into(), Some("4096".into())),
-        ("NRF70_RPU_PS_IDLE_TIMEOUT_MS".into(), Some("10".into())),
-        ("NRF_WIFI_DISPLAY_SCAN_BSS_LIMIT".into(), Some("64".into())),
+        ("NRF70_RX_NUM_BUFS".into(), "6".into()),
+        ("NRF70_RX_MAX_DATA_SIZE".into(), "1600".into()),
+        ("NRF70_MAX_TX_TOKENS".into(), "5".into()),
+        ("NRF70_MAX_TX_PENDING_QLEN".into(), "8".into()),
+        ("NRF70_PATCH_DL_CHUNK_SIZE".into(), "4096".into()),
+        ("NRF70_RPU_PS_IDLE_TIMEOUT_MS".into(), "10".into()),
+        ("NRF_WIFI_DISPLAY_SCAN_BSS_LIMIT".into(), "64".into()),
         (
             "NRF_WIFI_RPU_MIN_TIME_TO_ENTER_SLEEP_MS".into(),
-            Some("1000".into()),
+            "1000".into(),
         ),
-        ("NRF_WIFI_IFACE_MTU".into(), Some("1500".into())),
-        ("NRF_WIFI_AP_DEAD_DETECT_TIMEOUT".into(), Some("300".into())),
-        ("NRF_WIFI_PS_INT_PS".into(), Some("1".into())),
-        ("CONFIG_NRF70_REG_DOMAIN".into(), Some("00".into())),
-        ("WIFI_NRF70_LOG_LEVEL".into(), Some("1".into())),
+        ("NRF_WIFI_IFACE_MTU".into(), "1500".into()),
+        ("NRF_WIFI_AP_DEAD_DETECT_TIMEOUT".into(), "300".into()),
+        ("NRF_WIFI_PS_INT_PS".into(), "1".into()),
+        ("CONFIG_NRF70_REG_DOMAIN".into(), "00".into()),
+        ("WIFI_NRF70_LOG_LEVEL".into(), "1".into()),
         (
             "CONFIG_NRF_WIFI_SYS_FW_BIN".into(),
-            Some(firmware.display().to_string()),
+            firmware.display().to_string(),
         ),
-        ("malloc".into(), Some("nrf70_os_malloc".into())),
-        ("calloc".into(), Some("nrf70_os_calloc".into())),
-        ("free".into(), Some("nrf70_os_free".into())),
-        ("memcpy".into(), Some("nrf70_os_memcpy".into())),
-        ("memset".into(), Some("nrf70_os_memset".into())),
-        ("memcmp".into(), Some("nrf70_os_memcmp".into())),
-        ("strlen".into(), Some("nrf70_os_strlen".into())),
-        ("strcmp".into(), Some("nrf70_os_strcmp".into())),
-        ("printf".into(), Some("nrf70_os_printf".into())),
-        ("snprintf".into(), Some("nrf70_os_snprintf".into())),
     ];
     d.extend(
-        ZERO_DEFINES
+        NRF_WIFI_LIBC_INTERPOSERS
             .iter()
-            .map(|x| (x.to_string(), Some("0".into()))),
+            .map(|x| (x.to_string(), format!("nrf70_os_{x}"))),
     );
+    d.extend(ZERO_DEFINES.iter().map(|x| (x.to_string(), "0".into())));
     d.extend(
         ZERO_DEFINES
             .iter()
             .filter_map(|x| x.strip_prefix("CONFIG_"))
-            .map(|x| (x.to_string(), Some("0".into()))),
+            .map(|x| (x.to_string(), "0".into())),
     );
     d
 }
@@ -337,37 +437,12 @@ fn main() {
         }
         println!("cargo:rerun-if-changed={}", fw.display());
         println!("cargo:rerun-if-changed={}", lic.display());
-        let sysroot = Command::new(env::var("RUSTC").unwrap_or_else(|_| "rustc".into()))
-            .args(["--print", "sysroot"])
-            .output()
-            .expect("rustc sysroot");
-        let llvm_ar = PathBuf::from(String::from_utf8(sysroot.stdout).unwrap().trim()).join(
-            format!("lib/rustlib/{}/bin/llvm-ar", env::var("HOST").unwrap()),
-        );
+        let llvm_ar = llvm_tool("llvm-ar");
         if llvm_ar.is_file() {
             build.archiver(&llvm_ar);
         }
-        build
-            .flag("--target=arm-none-eabi")
-            .flag("-mcpu=cortex-m33")
-            .flag("-mthumb")
-            .flag("-mfloat-abi=hard")
-            .flag("-mfpu=fpv5-sp-d16")
-            .flag("-ffunction-sections")
-            .flag("-fdata-sections")
-            .flag("-fno-strict-aliasing")
-            .flag("-fno-builtin")
-            .flag("-ffreestanding");
-        clang_args.extend(
-            [
-                "--target=arm-none-eabi",
-                "-mcpu=cortex-m33",
-                "-mthumb",
-                "-mfloat-abi=hard",
-                "-mfpu=fpv5-sp-d16",
-            ]
-            .map(str::to_string),
-        );
+        apply_arm_flags(&mut build);
+        clang_args.extend(ARM_TARGET.iter().map(|x| x.to_string()));
         for i in INCLUDES {
             let p = root.join(i);
             build.include(&p);
@@ -375,74 +450,29 @@ fn main() {
         }
         let defs = define_args(&fw);
         for (k, v) in &defs {
-            build.define(k, v.as_deref());
-            if !matches!(
-                k.as_str(),
-                "malloc"
-                    | "calloc"
-                    | "free"
-                    | "memcpy"
-                    | "memset"
-                    | "memcmp"
-                    | "strlen"
-                    | "strcmp"
-                    | "printf"
-                    | "snprintf"
-            ) {
-                clang_args.push(match v {
-                    Some(v) => format!("-D{k}={v}"),
-                    None => format!("-D{k}"),
-                });
+            build.define(k, v.as_str());
+            if !NRF_WIFI_LIBC_INTERPOSERS.contains(&k.as_str()) {
+                clang_args.push(format!("-D{k}={v}"));
             }
         }
         build.file("src/facade.c");
         for s in SOURCES {
-            let p = root.join(s);
-            if !p.is_file() {
-                panic!("pinned source absent: {}", p.display())
-            }
-            if !fs::read_to_string(&p)
-                .unwrap_or_default()
-                .contains("SPDX-License-Identifier: BSD-3-Clause")
-            {
-                panic!("required BSD-3-Clause notice absent: {}", p.display())
-            }
-            println!("cargo:rerun-if-changed={}", p.display());
-            if *s == "nrf_wifi/fw_if/umac_if/src/system/fmac_api.c" {
-                let source = fs::read_to_string(&p).unwrap();
-                let marker = "\tif (auth_info->ssid.nrf_wifi_ssid_len > 0) {\n\t\tauth_cmd->valid_fields |= NRF_WIFI_CMD_AUTHENTICATE_SSID_VALID;\n\t}\n";
-                let replacement = "\tif (auth_info->ssid.nrf_wifi_ssid_len > 0) {\n\t\tauth_cmd->valid_fields |= NRF_WIFI_CMD_AUTHENTICATE_SSID_VALID;\n\t}\n\n\tif (!nrf_wifi_util_is_arr_zero(auth_info->nrf_wifi_bssid,\n\t\t\t\t       sizeof(auth_info->nrf_wifi_bssid))) {\n\t\tauth_cmd->valid_fields |= NRF_WIFI_CMD_AUTHENTICATE_BSSID_VALID;\n\t}\n";
-                let source = source.replacen(marker, replacement, 1);
-                if !source
-                    .contains("auth_cmd->valid_fields |= NRF_WIFI_CMD_AUTHENTICATE_BSSID_VALID")
-                {
-                    panic!("pinned open-auth BSSID patch no longer applies")
+            let p = vendored(
+                &root,
+                s,
+                "SPDX-License-Identifier: BSD-3-Clause",
+                "pinned source absent",
+                "required BSD-3-Clause notice absent",
+            );
+            if let Some(patch) = PATCHES.iter().find(|x| x.source == *s) {
+                let mut source = fs::read_to_string(&p).unwrap();
+                for (from, to) in patch.edits {
+                    source = source.replacen(from, to, 1);
                 }
-                let patched = out.join("fmac_api_open_bssid.c");
-                fs::write(&patched, source).unwrap();
-                build.file(patched);
-            } else if *s == "nrf_wifi/hw_if/hal/src/common/hal_api_common.c" {
-                let source = fs::read_to_string(&p).unwrap();
-                let source = source.replacen("unsigned int event_len = 0;\n\n\twhile (1) {", "unsigned int event_len = 0;\n\tunsigned int facade_events_processed = 0;\n\n\twhile (facade_events_processed < 1) {", 1);
-                let source = source.replacen("nrf_wifi_osal_mem_free(event);\n\t\tevent = NULL;\n\t}\n\nout:", "nrf_wifi_osal_mem_free(event);\n\t\tevent = NULL;\n\t\tfacade_events_processed++;\n\t}\n\tif (facade_events_processed == 1) {\n\t\tnrf_wifi_osal_tasklet_schedule(hal_dev_ctx->event_tasklet);\n\t}\n\nout:", 1);
-                if !source.contains("facade_events_processed") {
-                    panic!("pinned event-budget patch no longer applies")
+                if !source.contains(patch.marker) {
+                    panic!("{}", patch.panic_msg)
                 }
-                let patched = out.join("hal_api_common_bounded.c");
-                fs::write(&patched, source).unwrap();
-                build.file(patched);
-            } else if *s == "nrf_wifi/hw_if/hal/src/common/hal_interrupt.c" {
-                let source = fs::read_to_string(&p).unwrap();
-                let source = source.replacen("unsigned int event_addr = 0;\n\n\twhile (1) {", "unsigned int event_addr = 0;\n\tunsigned int facade_events_fetched = 0;\n\n\twhile (facade_events_fetched < 1) {", 1);
-                let source = source.replacen(
-                    "\t\tnum_events++;\n\t}\n\nout:",
-                    "\t\tnum_events++;\n\t\tfacade_events_fetched++;\n\t}\n\nout:",
-                    1,
-                );
-                if !source.contains("facade_events_fetched") {
-                    panic!("pinned IRQ-budget patch no longer applies")
-                }
-                let patched = out.join("hal_interrupt_bounded.c");
+                let patched = out.join(patch.out_name);
                 fs::write(&patched, source).unwrap();
                 build.file(patched);
             } else {
@@ -466,18 +496,9 @@ fn main() {
         let mut supp = cc::Build::new();
         supp.compiler("clang")
             .flag("-std=c11")
-            .flag("-fno-short-enums")
-            .flag("--target=arm-none-eabi")
-            .flag("-mcpu=cortex-m33")
-            .flag("-mthumb")
-            .flag("-mfloat-abi=hard")
-            .flag("-mfpu=fpv5-sp-d16")
-            .flag("-ffunction-sections")
-            .flag("-fdata-sections")
-            .flag("-fno-strict-aliasing")
-            .flag("-fno-builtin")
-            .flag("-ffreestanding")
-            .include(&shim)
+            .flag("-fno-short-enums");
+        apply_arm_flags(&mut supp);
+        supp.include(&shim)
             .include(hostap.join("src"))
             .include(hostap.join("src/utils"));
         if llvm_ar.is_file() {
@@ -498,18 +519,13 @@ fn main() {
             .define("bswap_32", Some("__builtin_bswap32"))
             .define("bswap_64", Some("__builtin_bswap64"));
         for s in HOSTAP_SOURCES {
-            let p = hostap.join(s);
-            if !p.is_file() {
-                panic!("pinned hostap source absent: {}", p.display())
-            }
-            if !fs::read_to_string(&p)
-                .unwrap_or_default()
-                .contains("distributed under the terms of the BSD license")
-            {
-                panic!("required BSD license notice absent: {}", p.display())
-            }
-            println!("cargo:rerun-if-changed={}", p.display());
-            supp.file(p);
+            supp.file(vendored(
+                &hostap,
+                s,
+                "distributed under the terms of the BSD license",
+                "pinned hostap source absent",
+                "required BSD license notice absent",
+            ));
         }
         supp.file("src/supplicant.c");
         supplicant_build = Some(supp);
@@ -519,14 +535,7 @@ fn main() {
         supp.compile("nrf70_supplicant");
     }
     if !mock {
-        let sysroot = Command::new(env::var("RUSTC").unwrap_or_else(|_| "rustc".into()))
-            .args(["--print", "sysroot"])
-            .output()
-            .unwrap();
-        let nm = PathBuf::from(String::from_utf8(sysroot.stdout).unwrap().trim()).join(format!(
-            "lib/rustlib/{}/bin/llvm-nm",
-            env::var("HOST").unwrap()
-        ));
+        let nm = llvm_tool("llvm-nm");
         if !nm.is_file() {
             panic!("llvm-nm is required for the OSAL undefined-symbol inventory")
         }

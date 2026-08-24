@@ -30,9 +30,6 @@ impl<D, C> SpiTransport<D, C> {
     pub const fn new(device: D, control: C) -> Self {
         Self { device, control }
     }
-    pub fn into_inner(self) -> (D, C) {
-        (self.device, self.control)
-    }
 }
 
 impl<D: SpiDevice<u8>, C: BoardControl> SpiTransport<D, C> {
@@ -48,52 +45,54 @@ impl<D: SpiDevice<u8>, C: BoardControl> SpiTransport<D, C> {
     /// The wakeup write can be missed if it lands while the chip is still
     /// ramping its rails, so retry the whole handshake a few times.
     fn wake_rpu(&mut self) -> Result<(), ()> {
-        let mut result = Err(());
-        for _ in 0..3 {
-            result = self.try_wake_rpu();
-            if result.is_ok() {
-                break;
+        (0..3).find_map(|_| self.try_wake_rpu().ok()).ok_or(())
+    }
+    /// Reads `opcode` up to ten times waiting for `mask` to set, delaying 1 ms
+    /// after every miss (including the last). The inner `Err` carries the last
+    /// status seen; the outer `Err` is a bus failure.
+    fn poll_status(&mut self, opcode: u8, mask: u8) -> Result<Result<u8, u8>, ()> {
+        let mut status = 0u8;
+        for _ in 0..10 {
+            status = self.status_read(opcode)?;
+            if status & mask != 0 {
+                return Ok(Ok(status));
             }
+            self.control.delay_us(1000)
         }
-        result
+        Ok(Err(status))
     }
     fn try_wake_rpu(&mut self) -> Result<(), ()> {
         self.status_write(0x3f, RPU_WAKE)?;
-        let mut status = 0u8;
-        let mut ack = false;
-        for _ in 0..10 {
-            status = self.status_read(0x2f)?;
-            if status & RPU_WAKE != 0 {
-                ack = true;
-                break;
-            }
-            self.control.delay_us(1000)
-        }
-        if !ack {
+        if let Err(_status) = self.poll_status(0x2f, RPU_WAKE)? {
             // 0x00 usually means no SPI response (power/wiring/CS), 0xff a
             // floating MISO line.
             #[cfg(feature = "defmt")]
-            defmt::warn!("nrf70: RPU wake not acknowledged, RDSR2={=u8:#04x}", status);
+            defmt::warn!(
+                "nrf70: RPU wake not acknowledged, RDSR2={=u8:#04x}",
+                _status
+            );
             return Err(());
         }
-        let mut awake = false;
-        for _ in 0..10 {
-            status = self.status_read(0x1f)?;
-            if status & RPU_AWAKE != 0 {
-                awake = true;
-                break;
-            }
-            self.control.delay_us(1000)
-        }
-        if !awake {
+        if let Err(_status) = self.poll_status(0x1f, RPU_AWAKE)? {
             #[cfg(feature = "defmt")]
             defmt::warn!(
                 "nrf70: RPU wake acked but not awake, RDSR1={=u8:#04x}",
-                status
+                _status
             );
             return Err(());
         }
         Ok(())
+    }
+    /// The four-byte SPI command header (opcode plus 24-bit address) followed
+    /// by the one dummy byte the read opcodes need; writes use `[..4]`.
+    const fn header(opcode: u8, address: u32) -> [u8; 5] {
+        [
+            opcode,
+            ((address >> 16) & 0xff) as u8,
+            ((address >> 8) & 0xff) as u8,
+            address as u8,
+            0,
+        ]
     }
     fn latency(address: u32, length: usize, write: bool) -> Result<u8, ()> {
         if length == 0 || address.checked_add(length as u32 - 1).is_none() {
@@ -130,15 +129,9 @@ impl<D: SpiDevice<u8>, C: BoardControl> SpiTransport<D, C> {
             );
             return Err(());
         }
-        let a = address | 0x800000;
-        let header = [
-            0x02,
-            ((a >> 16) & 0xff) as u8,
-            ((a >> 8) & 0xff) as u8,
-            a as u8,
-        ];
+        let header = Self::header(0x02, address | 0x800000);
         self.device
-            .transaction(&mut [Operation::Write(&header), Operation::Write(src)])
+            .transaction(&mut [Operation::Write(&header[..4]), Operation::Write(src)])
             .map_err(|_e| {
                 #[cfg(feature = "defmt")]
                 defmt::error!(
@@ -158,28 +151,16 @@ impl<D: SpiDevice<u8>, C: BoardControl> SpiTransport<D, C> {
             );
         })?;
         if latency == 0 {
-            let a = address | 0x800000;
-            let header = [
-                0x0b,
-                ((a >> 16) & 0xff) as u8,
-                ((a >> 8) & 0xff) as u8,
-                a as u8,
-                0,
-            ];
+            let header = Self::header(0x0b, address | 0x800000);
             return self
                 .device
                 .transaction(&mut [Operation::Write(&header), Operation::Read(dst)])
                 .map_err(|_| ());
         }
         for (i, word) in dst.chunks_exact_mut(4).enumerate() {
-            let a = address + i as u32 * 4;
-            let header = [
-                0x0b,
-                ((a >> 16) & 0xff) as u8,
-                ((a >> 8) & 0xff) as u8,
-                a as u8,
-                0,
-            ];
+            // Unlike the two paths above, the latency>0 windows are addressed
+            // without the 0x800000 bit; this is a real hardware distinction.
+            let header = Self::header(0x0b, address + i as u32 * 4);
             let mut scratch = [0u8; 12];
             let n = latency as usize * 4 + 4;
             self.device
@@ -243,22 +224,28 @@ impl<D: SpiDevice<u8> + Send, C: BoardControl + Send> Bus for SpiTransport<D, C>
     }
     #[cfg(feature = "defmt")]
     fn log(&mut self, level: u8, message: *const core::ffi::c_char) {
+        // The facade's contract is that `message` is a nul-terminated static.
+        let message = unsafe { c_message(message) };
         match level {
-            0 => defmt::debug!("nrf70: {=str}", c_message(message)),
-            1 => defmt::info!("nrf70: {=str}", c_message(message)),
-            2 => defmt::warn!("nrf70: {=str}", c_message(message)),
-            _ => defmt::error!("nrf70: {=str}", c_message(message)),
+            0 => defmt::debug!("nrf70: {=str}", message),
+            1 => defmt::info!("nrf70: {=str}", message),
+            2 => defmt::warn!("nrf70: {=str}", message),
+            _ => defmt::error!("nrf70: {=str}", message),
         }
     }
     #[cfg(feature = "defmt")]
     fn fatal(&mut self, reason: i32, message: *const core::ffi::c_char) {
-        defmt::error!("nrf70: fatal {=i32}: {=str}", reason, c_message(message));
+        // The facade's contract is that `message` is a nul-terminated static.
+        let message = unsafe { c_message(message) };
+        defmt::error!("nrf70: fatal {=i32}: {=str}", reason, message);
     }
 }
 
 /// The C facade only passes nul-terminated static strings (never key material).
+/// # Safety `message` must be null or point to a nul-terminated string that
+/// outlives the returned borrow.
 #[cfg(feature = "defmt")]
-fn c_message<'a>(message: *const core::ffi::c_char) -> &'a str {
+unsafe fn c_message<'a>(message: *const core::ffi::c_char) -> &'a str {
     if message.is_null() {
         return "<null>";
     }

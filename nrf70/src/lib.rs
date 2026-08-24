@@ -26,7 +26,6 @@ use zeroize::Zeroize;
 pub const MAX_SCAN_RESULTS: usize = 64;
 pub const EVENT_DRAIN_BUDGET: u32 = 8;
 pub const ETHERNET_FRAME_SIZE: usize = 1514;
-pub const IP_MTU: usize = 1500;
 pub const OPEN_CONNECT_TIMEOUT_US: u32 = 10_000_000;
 /// Secured sessions cover PMK derivation, the connect scan, auth/assoc, and
 /// the 4-way handshake, so they get a longer budget than open connects.
@@ -502,25 +501,19 @@ impl Wifi<'_> {
             _ => Err(Error::Fatal),
         }
     }
-    pub async fn initialize(&self, mac: [u8; 6], country: Country) -> Result<(), Error> {
+    /// Runs a command that neither cancels on drop nor streams results: take
+    /// the guard, send the command built from its id, await the single `Done`.
+    async fn simple(&self, make: impl FnOnce(u32) -> Command) -> Result<(), Error> {
         let g = self.guard(false)?;
-        self.r
-            .commands
-            .send(Command::Initialize {
-                id: g.id,
-                mac,
-                country,
-            })
-            .await;
+        self.r.commands.send(make(g.id)).await;
         self.done(&g).await
     }
+    pub async fn initialize(&self, mac: [u8; 6], country: Country) -> Result<(), Error> {
+        self.simple(|id| Command::Initialize { id, mac, country })
+            .await
+    }
     pub async fn set_country(&self, country: Country) -> Result<(), Error> {
-        let g = self.guard(false)?;
-        self.r
-            .commands
-            .send(Command::SetCountry { id: g.id, country })
-            .await;
-        self.done(&g).await
+        self.simple(|id| Command::SetCountry { id, country }).await
     }
     pub async fn scan(
         &self,
@@ -550,6 +543,50 @@ impl Wifi<'_> {
             }
         }
     }
+    /// Scans 5 GHz for the request's SSID and picks the best-RSSI AP whose
+    /// security fits the credential. Any given `bssid`/`frequency_mhz` only
+    /// filters the candidates.
+    async fn select_ap(&self, request: &ConnectRequest) -> Result<([u8; 6], u16, Security), Error> {
+        let mut scan = ScanRequest::five_ghz(request.country);
+        scan.ssid_filter = request.ssid.clone();
+        let aps = self.scan(scan).await?;
+        let mut best: Option<&AccessPoint> = None;
+        let mut ssid_seen = false;
+        for ap in aps.iter() {
+            if ap.ssid != request.ssid {
+                continue;
+            }
+            if let Some(wanted) = request.bssid
+                && ap.bssid != wanted
+            {
+                continue;
+            }
+            if let Some(wanted) = request.frequency_mhz
+                && channel_to_5ghz_frequency(ap.channel) != Some(wanted)
+            {
+                continue;
+            }
+            ssid_seen = true;
+            if !credential_compatible(ap.security, &request.credential) {
+                continue;
+            }
+            if best.is_none_or(|b| ap.rssi_dbm > b.rssi_dbm) {
+                best = Some(ap);
+            }
+        }
+        let Some(ap) = best else {
+            return Err(if ssid_seen {
+                Error::IncompatibleSecurity
+            } else {
+                Error::NotFound
+            });
+        };
+        // The connect target frequency always comes from the
+        // picked AP's own channel; a requested frequency only
+        // filters the candidates above.
+        let frequency_mhz = channel_to_5ghz_frequency(ap.channel).ok_or(Error::InvalidRequest)?;
+        Ok((ap.bssid, frequency_mhz, ap.security))
+    }
     /// Connects to a network. Open networks complete on link-up; secured
     /// networks (WPA2-Personal CCMP) complete once the supplicant finishes the
     /// 4-way handshake and authorizes the controlled port, so a returned
@@ -573,66 +610,22 @@ impl Wifi<'_> {
                 };
                 (bssid, frequency_mhz, security)
             }
-            _ => {
-                let mut scan = ScanRequest::five_ghz(request.country);
-                scan.ssid_filter = request.ssid.clone();
-                let aps = self.scan(scan).await?;
-                let mut best: Option<&AccessPoint> = None;
-                let mut ssid_seen = false;
-                for ap in aps.iter() {
-                    if ap.ssid != request.ssid {
-                        continue;
-                    }
-                    if let Some(wanted) = request.bssid
-                        && ap.bssid != wanted
-                    {
-                        continue;
-                    }
-                    if let Some(wanted) = request.frequency_mhz
-                        && channel_to_5ghz_frequency(ap.channel) != Some(wanted)
-                    {
-                        continue;
-                    }
-                    ssid_seen = true;
-                    if !credential_compatible(ap.security, &request.credential) {
-                        continue;
-                    }
-                    if best.is_none_or(|b| ap.rssi_dbm > b.rssi_dbm) {
-                        best = Some(ap);
-                    }
-                }
-                let Some(ap) = best else {
-                    return Err(if ssid_seen {
-                        Error::IncompatibleSecurity
-                    } else {
-                        Error::NotFound
-                    });
-                };
-                // The connect target frequency always comes from the
-                // picked AP's own channel; a requested frequency only
-                // filters the candidates above.
-                let frequency_mhz =
-                    channel_to_5ghz_frequency(ap.channel).ok_or(Error::InvalidRequest)?;
-                (ap.bssid, frequency_mhz, ap.security)
-            }
+            _ => self.select_ap(&request).await?,
         };
         let mut ssid = [0u8; 32];
         ssid[..request.ssid.len()].copy_from_slice(&request.ssid);
-        let (credential_kind, credential_len, mut credential) = match &request.credential {
-            Credential::Open => (nrf70_sys::CREDENTIAL_NONE, 0u8, [0u8; 64]),
+        // One buffer for the secret bytes on every path, zeroized below once
+        // the target has taken its copy.
+        let mut credential = [0u8; 64];
+        let (credential_kind, credential_len) = match &request.credential {
+            Credential::Open => (nrf70_sys::CREDENTIAL_NONE, 0u8),
             Credential::Passphrase(p) => {
-                let mut bytes = [0u8; 64];
-                bytes[..p.as_bytes().len()].copy_from_slice(p.as_bytes());
-                (
-                    nrf70_sys::CREDENTIAL_PASSPHRASE,
-                    p.as_bytes().len() as u8,
-                    bytes,
-                )
+                credential[..p.as_bytes().len()].copy_from_slice(p.as_bytes());
+                (nrf70_sys::CREDENTIAL_PASSPHRASE, p.as_bytes().len() as u8)
             }
             Credential::Psk(psk) => {
-                let mut bytes = [0u8; 64];
-                bytes[..32].copy_from_slice(psk);
-                (nrf70_sys::CREDENTIAL_PSK, 32, bytes)
+                credential[..32].copy_from_slice(psk);
+                (nrf70_sys::CREDENTIAL_PSK, 32)
             }
         };
         let target = ConnectParams(nrf70_sys::ConnectTarget {
@@ -669,30 +662,17 @@ impl Wifi<'_> {
         result
     }
     pub async fn disconnect(&self, reason: u16) -> Result<(), Error> {
-        let g = self.guard(false)?;
-        self.r
-            .commands
-            .send(Command::Disconnect { id: g.id, reason })
-            .await;
-        self.done(&g).await
+        self.simple(|id| Command::Disconnect { id, reason }).await
     }
     pub async fn set_power_save(&self, enabled: bool) -> Result<(), Error> {
-        let g = self.guard(false)?;
-        self.r
-            .commands
-            .send(Command::SetPowerSave { id: g.id, enabled })
-            .await;
-        self.done(&g).await
+        self.simple(|id| Command::SetPowerSave { id, enabled })
+            .await
     }
     pub async fn reset(&self) -> Result<(), Error> {
-        let g = self.guard(false)?;
-        self.r.commands.send(Command::Reset { id: g.id }).await;
-        self.done(&g).await
+        self.simple(|id| Command::Reset { id }).await
     }
     pub async fn shutdown(&self) -> Result<(), Error> {
-        let g = self.guard(false)?;
-        self.r.commands.send(Command::Shutdown { id: g.id }).await;
-        self.done(&g).await
+        self.simple(|id| Command::Shutdown { id }).await
     }
     pub async fn stats(&self) -> Result<Stats, Error> {
         let g = self.guard(false)?;
@@ -734,17 +714,13 @@ impl<B: Bus + Send + 'static, const N: usize> Runner<'_, B, N> {
             self.r.dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
-    fn terminal(&self, response: Response) {
-        let mut response = Some(response);
-        loop {
-            match self.r.responses.try_send(response.take().unwrap()) {
-                Ok(()) => return,
-                Err(embassy_sync::channel::TrySendError::Full(returned)) => {
-                    response = Some(returned);
-                    if self.r.responses.try_receive().is_ok() {
-                        self.r.dropped.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
+    fn terminal(&self, mut response: Response) {
+        while let Err(embassy_sync::channel::TrySendError::Full(returned)) =
+            self.r.responses.try_send(response)
+        {
+            response = returned;
+            if self.r.responses.try_receive().is_ok() {
+                self.r.dropped.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -789,140 +765,150 @@ impl<B: Bus + Send + 'static, const N: usize> Runner<'_, B, N> {
     }
     fn command(&mut self, cmd: Command) {
         match cmd {
-            Command::Initialize { id, mac, country } => {
-                let result = if self.initialized {
-                    Err(Error::Busy)
-                } else {
-                    unsafe { nrf70_sys::init(self.platform, mac, country.bytes()) }
-                        .map_err(Into::into)
-                };
-                if result.is_ok() {
-                    self.initialized = true;
-                    self.mac = mac;
-                    self.country = Some(country);
-                    let s = unsafe { nrf70_sys::stats() };
-                    self.generation = s.generation;
-                    if let Some(net) = &mut self.net {
-                        net.set_hardware_address(HardwareAddress::Ethernet(mac));
-                        net.set_link_state(LinkState::Down)
-                    }
-                }
-                self.terminal(Response::Done { id, result })
-            }
-            Command::SetCountry { id, country } => {
-                let result = if self.scan_id.is_some() || self.connect_id.is_some() {
-                    Err(Error::Busy)
-                } else {
-                    unsafe { nrf70_sys::set_country(country.bytes()) }.map_err(Into::into)
-                };
-                if result.is_ok() {
-                    self.country = Some(country)
-                }
-                self.fatal_if_needed(&result);
-                self.terminal(Response::Done { id, result })
-            }
-            Command::Scan { id, request } => {
-                if self.scan_id.is_some() {
-                    self.terminal(Response::ScanDone {
-                        id,
-                        result: Err(Error::Busy),
-                    })
-                } else {
-                    let result = self.start_scan(request);
-                    if result.is_ok() {
-                        self.scan_id = Some(id)
-                    } else {
-                        self.terminal(Response::ScanDone { id, result })
-                    }
-                }
-            }
-            Command::Connect { id } => {
-                if self.connect_id.is_some() || self.scan_id.is_some() {
-                    self.scrub_connect_stash();
-                    self.terminal(Response::Done {
-                        id,
-                        result: Err(Error::Busy),
-                    })
-                } else {
-                    // Start from the stash in place: the credential bytes are
-                    // never moved out of the static slot, and are zeroized
-                    // there before the slot is cleared.
-                    let outcome = self.r.connect_stash.lock(|stash| {
-                        let mut slot = stash.borrow_mut();
-                        let outcome = match slot.as_mut() {
-                            None => Err(Error::InvalidRequest),
-                            Some(params) => {
-                                let secured = params.0.security != nrf70_sys::Security::Open;
-                                let result = unsafe { nrf70_sys::connect_start(&params.0) }
-                                    .map(|_| secured)
-                                    .map_err(Error::from);
-                                params.0.credential.zeroize();
-                                params.0.credential_len = 0;
-                                result
-                            }
-                        };
-                        // Drops in place; the credential is already zeroized.
-                        *slot = None;
-                        outcome
-                    });
-                    match outcome {
-                        Ok(secured) => {
-                            self.connect_id = Some(id);
-                            self.clear_session();
-                            self.secured = secured;
-                            self.connect_deadline = self.platform_time().wrapping_add(if secured {
-                                SECURE_CONNECT_TIMEOUT_US
-                            } else {
-                                OPEN_CONNECT_TIMEOUT_US
-                            })
-                        }
-                        Err(error) => self.terminal(Response::Done {
-                            id,
-                            result: Err(error),
-                        }),
-                    }
-                }
-            }
-            Command::Disconnect { id, reason } => {
-                let result = unsafe { nrf70_sys::disconnect(reason) }.map_err(Into::into);
-                self.terminal(Response::Done { id, result })
-            }
-            Command::SetPowerSave { id, enabled } => self.terminal(Response::Done {
-                id,
-                result: unsafe { nrf70_sys::set_power_save(enabled) }.map_err(Into::into),
-            }),
-            Command::Reset { id } => {
-                let result = self.reset_driver();
-                self.terminal(Response::Done { id, result })
-            }
-            Command::Shutdown { id } => {
-                let result = if self.initialized {
-                    unsafe { nrf70_sys::deinit() }.map_err(Into::into)
-                } else {
-                    Err(Error::NotInitialized)
-                };
-                self.initialized = false;
-                self.fail_operations(Error::Cancelled);
-                self.clear_session();
-                self.set_link(false, 0, 0);
-                self.terminal(Response::Done { id, result })
-            }
-            Command::Stats { id } => {
-                let mut c = unsafe { nrf70_sys::stats() };
-                c.arena_used = self.platform.arena().used();
-                c.arena_high_water = self.platform.arena().high_water();
-                self.terminal(Response::Stats {
-                    id,
-                    stats: Stats {
-                        c,
-                        dropped_results: self.r.dropped.load(Ordering::Relaxed),
-                        stale_events: self.r.stale.load(Ordering::Relaxed),
-                        tx_channel_drops: self.r.tx_drops.load(Ordering::Relaxed),
-                        connect_timeouts: self.r.timeouts.load(Ordering::Relaxed),
-                    },
-                })
+            Command::Initialize { id, mac, country } => self.cmd_initialize(id, mac, country),
+            Command::SetCountry { id, country } => self.cmd_set_country(id, country),
+            Command::Scan { id, request } => self.cmd_scan(id, request),
+            Command::Connect { id } => self.cmd_connect(id),
+            Command::Disconnect { id, reason } => self.cmd_disconnect(id, reason),
+            Command::SetPowerSave { id, enabled } => self.cmd_set_power_save(id, enabled),
+            Command::Reset { id } => self.cmd_reset(id),
+            Command::Shutdown { id } => self.cmd_shutdown(id),
+            Command::Stats { id } => self.cmd_stats(id),
+        }
+    }
+    fn cmd_initialize(&mut self, id: u32, mac: [u8; 6], country: Country) {
+        let result = if self.initialized {
+            Err(Error::Busy)
+        } else {
+            unsafe { nrf70_sys::init(self.platform, mac, country.bytes()) }.map_err(Error::from)
+        };
+        if result.is_ok() {
+            self.initialized = true;
+            self.mac = mac;
+            self.country = Some(country);
+            let s = unsafe { nrf70_sys::stats() };
+            self.generation = s.generation;
+            if let Some(net) = &mut self.net {
+                net.set_hardware_address(HardwareAddress::Ethernet(mac));
+                net.set_link_state(LinkState::Down)
             }
         }
+        self.terminal(Response::Done { id, result })
+    }
+    fn cmd_set_country(&mut self, id: u32, country: Country) {
+        let result = if self.scan_id.is_some() || self.connect_id.is_some() {
+            Err(Error::Busy)
+        } else {
+            unsafe { nrf70_sys::set_country(country.bytes()) }.map_err(Error::from)
+        };
+        if result.is_ok() {
+            self.country = Some(country)
+        }
+        self.fatal_if_needed(&result);
+        self.terminal(Response::Done { id, result })
+    }
+    fn cmd_scan(&mut self, id: u32, request: ScanRequest) {
+        if self.scan_id.is_some() {
+            self.terminal(Response::ScanDone {
+                id,
+                result: Err(Error::Busy),
+            })
+        } else {
+            let result = self.start_scan(request);
+            if result.is_ok() {
+                self.scan_id = Some(id)
+            } else {
+                self.terminal(Response::ScanDone { id, result })
+            }
+        }
+    }
+    fn cmd_connect(&mut self, id: u32) {
+        if self.connect_id.is_some() || self.scan_id.is_some() {
+            self.scrub_connect_stash();
+            self.terminal(Response::Done {
+                id,
+                result: Err(Error::Busy),
+            })
+        } else {
+            // Start from the stash in place: the credential bytes are
+            // never moved out of the static slot, and are zeroized
+            // there before the slot is cleared.
+            let outcome = self.r.connect_stash.lock(|stash| {
+                let mut slot = stash.borrow_mut();
+                let outcome = match slot.as_mut() {
+                    None => Err(Error::InvalidRequest),
+                    Some(params) => {
+                        let secured = params.0.security != nrf70_sys::Security::Open;
+                        let result = unsafe { nrf70_sys::connect_start(&params.0) }
+                            .map(|_| secured)
+                            .map_err(Error::from);
+                        params.0.credential.zeroize();
+                        params.0.credential_len = 0;
+                        result
+                    }
+                };
+                // Drops in place; the credential is already zeroized.
+                *slot = None;
+                outcome
+            });
+            match outcome {
+                Ok(secured) => {
+                    self.connect_id = Some(id);
+                    self.clear_session();
+                    self.secured = secured;
+                    self.connect_deadline = self.platform_time().wrapping_add(if secured {
+                        SECURE_CONNECT_TIMEOUT_US
+                    } else {
+                        OPEN_CONNECT_TIMEOUT_US
+                    })
+                }
+                Err(error) => self.terminal(Response::Done {
+                    id,
+                    result: Err(error),
+                }),
+            }
+        }
+    }
+    fn cmd_disconnect(&mut self, id: u32, reason: u16) {
+        let result = unsafe { nrf70_sys::disconnect(reason) }.map_err(Error::from);
+        self.terminal(Response::Done { id, result })
+    }
+    fn cmd_set_power_save(&mut self, id: u32, enabled: bool) {
+        self.terminal(Response::Done {
+            id,
+            result: unsafe { nrf70_sys::set_power_save(enabled) }.map_err(Error::from),
+        })
+    }
+    fn cmd_reset(&mut self, id: u32) {
+        let result = self.reset_driver();
+        self.terminal(Response::Done { id, result })
+    }
+    fn cmd_shutdown(&mut self, id: u32) {
+        let result = if self.initialized {
+            unsafe { nrf70_sys::deinit() }.map_err(Error::from)
+        } else {
+            Err(Error::NotInitialized)
+        };
+        self.initialized = false;
+        self.fail_operations(Error::Cancelled);
+        self.clear_session();
+        self.set_link(false, 0, 0);
+        self.terminal(Response::Done { id, result })
+    }
+    fn cmd_stats(&mut self, id: u32) {
+        let mut c = unsafe { nrf70_sys::stats() };
+        c.arena_used = self.platform.arena().used();
+        c.arena_high_water = self.platform.arena().high_water();
+        self.terminal(Response::Stats {
+            id,
+            stats: Stats {
+                c,
+                dropped_results: self.r.dropped.load(Ordering::Relaxed),
+                stale_events: self.r.stale.load(Ordering::Relaxed),
+                tx_channel_drops: self.r.tx_drops.load(Ordering::Relaxed),
+                connect_timeouts: self.r.timeouts.load(Ordering::Relaxed),
+            },
+        })
     }
     fn platform_time(&self) -> u32 {
         self.platform.now_us_for_runner()
@@ -934,7 +920,7 @@ impl<B: Bus + Send + 'static, const N: usize> Runner<'_, B, N> {
         if q.max_results as usize > MAX_SCAN_RESULTS {
             return Err(Error::InvalidRequest);
         }
-        unsafe { nrf70_sys::set_country(q.country.bytes()) }?;
+        unsafe { nrf70_sys::set_country(q.country.bytes()) }.map_err(Error::from)?;
         let mut r = nrf70_sys::ScanRequest {
             passive: q.passive,
             channel_count: q.channels.len() as u8,
@@ -951,7 +937,7 @@ impl<B: Bus + Send + 'static, const N: usize> Runner<'_, B, N> {
                 channel: *c,
             }
         }
-        unsafe { nrf70_sys::scan_start(&r) }.map_err(Into::into)
+        unsafe { nrf70_sys::scan_start(&r) }.map_err(Error::from)
     }
     fn drain_events(&mut self) {
         while let Some(event) = unsafe { nrf70_sys::event_pop() } {
@@ -974,35 +960,7 @@ impl<B: Bus + Send + 'static, const N: usize> Runner<'_, B, N> {
                 continue;
             }
             match event {
-                nrf70_sys::Event::ScanResult { result, .. } => {
-                    if let Some(id) = self.scan_id {
-                        let mut ssid = Vec::new();
-                        let _ = ssid
-                            .extend_from_slice(&result.ssid[..result.ssid_len.min(32) as usize]);
-                        let ap = AccessPoint {
-                            ssid,
-                            channel: result.channel,
-                            rssi_dbm: result.rssi_dbm,
-                            bssid: result.bssid,
-                            security: match result.security {
-                                nrf70_sys::Security::Open => Security::Open,
-                                nrf70_sys::Security::Wpa2Psk => Security::Wpa2Personal,
-                                nrf70_sys::Security::Wpa2PskSha256 => Security::Wpa2Sha256,
-                                nrf70_sys::Security::Wpa3Sae => Security::Wpa3Sae,
-                                nrf70_sys::Security::Other => Security::Other,
-                            },
-                            mfp: result.mfp,
-                        };
-                        if self
-                            .r
-                            .responses
-                            .try_send(Response::Result { id, ap })
-                            .is_err()
-                        {
-                            self.r.dropped.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                }
+                nrf70_sys::Event::ScanResult { result, .. } => self.on_scan_result(result),
                 nrf70_sys::Event::ScanComplete { status, .. } => {
                     #[cfg(feature = "defmt")]
                     if status != 0 {
@@ -1039,71 +997,13 @@ impl<B: Bus + Send + 'static, const N: usize> Runner<'_, B, N> {
                     frequency_mhz,
                     rssi_dbm,
                     ..
-                } => {
-                    if up && self.connect_id.is_none() && !self.session_established {
-                        // Stale carrier-up: no connect is pending and no
-                        // session was ever established (e.g. assoc completed
-                        // just before an abort's deauth reached the firmware).
-                        // Raising the link here would open the data path with
-                        // no keys installed, so force the firmware link back
-                        // down instead and never surface the event.
-                        self.r.stale.fetch_add(1, Ordering::Relaxed);
-                        let _ = unsafe { nrf70_sys::disconnect(3) };
-                    } else if up && self.secured && !self.port_authorized {
-                        // Secured sessions are not usable until PORT_AUTHORIZED;
-                        // hold the net link down and remember the radio numbers.
-                        self.pending_link = Some((frequency_mhz, rssi_dbm));
-                    } else {
-                        self.set_link(up, frequency_mhz, rssi_dbm);
-                        if up && let Some(id) = self.connect_id.take() {
-                            self.session_established = true;
-                            self.terminal(Response::Done { id, result: Ok(()) })
-                        }
-                    }
-                }
-                nrf70_sys::Event::PortAuthorized { .. } => {
-                    self.port_authorized = true;
-                    self.session_established = true;
-                    let (frequency_mhz, rssi_dbm) = self.pending_link.take().unwrap_or((0, 0));
-                    self.set_link(true, frequency_mhz, rssi_dbm);
-                    if let Some(id) = self.connect_id.take() {
-                        self.terminal(Response::Done { id, result: Ok(()) })
-                    }
-                }
+                } => self.on_link(up, frequency_mhz, rssi_dbm),
+                nrf70_sys::Event::PortAuthorized { .. } => self.on_port_authorized(),
                 nrf70_sys::Event::HandshakeFailed { reason_code, .. } => {
-                    self.last_reason = reason_code;
-                    self.clear_session();
-                    if self.linked {
-                        self.set_link(false, 0, 0);
-                    } else {
-                        // The net link never rose (the Link-up was parked
-                        // during the handshake), so set_link would emit
-                        // nothing; report the 802.11 reason code directly.
-                        self.emit(LinkEvent::Down { reason_code });
-                    }
-                    if let Some(id) = self.connect_id.take() {
-                        self.terminal(Response::Done {
-                            id,
-                            result: Err(Error::HandshakeFailed),
-                        })
-                    }
+                    self.on_handshake_failed(reason_code)
                 }
                 nrf70_sys::Event::Disconnected { reason_code, .. } => {
-                    self.last_reason = reason_code;
-                    self.clear_session();
-                    if self.linked {
-                        self.set_link(false, 0, 0);
-                    } else if self.connect_id.is_some() {
-                        // A connect failed before the net link ever rose;
-                        // surface the reason code that set_link would swallow.
-                        self.emit(LinkEvent::Down { reason_code });
-                    }
-                    if let Some(id) = self.connect_id.take() {
-                        self.terminal(Response::Done {
-                            id,
-                            result: Err(Error::Io),
-                        })
-                    }
+                    self.on_disconnected(reason_code)
                 }
                 nrf70_sys::Event::TxComplete { status, .. } => {
                     if status != 0 {
@@ -1116,18 +1016,113 @@ impl<B: Bus + Send + 'static, const N: usize> Runner<'_, B, N> {
                     self.clear_session();
                     self.set_link(false, 0, 0)
                 }
-                nrf70_sys::Event::Fatal { .. } => {
-                    self.emit(LinkEvent::Fatal);
-                    self.fail_operations(Error::Fatal);
-                    if self.initialized {
-                        let _ = unsafe { nrf70_sys::deinit() };
-                        self.initialized = false
-                    }
-                    self.clear_session();
-                    self.set_link(false, 0, 0)
-                }
+                nrf70_sys::Event::Fatal { .. } => self.on_fatal(),
             }
         }
+    }
+    fn on_scan_result(&mut self, result: nrf70_sys::ScanResult) {
+        if let Some(id) = self.scan_id {
+            let mut ssid = Vec::new();
+            let _ = ssid.extend_from_slice(&result.ssid[..result.ssid_len.min(32) as usize]);
+            let ap = AccessPoint {
+                ssid,
+                channel: result.channel,
+                rssi_dbm: result.rssi_dbm,
+                bssid: result.bssid,
+                security: match result.security {
+                    nrf70_sys::Security::Open => Security::Open,
+                    nrf70_sys::Security::Wpa2Psk => Security::Wpa2Personal,
+                    nrf70_sys::Security::Wpa2PskSha256 => Security::Wpa2Sha256,
+                    nrf70_sys::Security::Wpa3Sae => Security::Wpa3Sae,
+                    nrf70_sys::Security::Other => Security::Other,
+                },
+                mfp: result.mfp,
+            };
+            if self
+                .r
+                .responses
+                .try_send(Response::Result { id, ap })
+                .is_err()
+            {
+                self.r.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    fn on_link(&mut self, up: bool, frequency_mhz: u16, rssi_dbm: i8) {
+        if up && self.connect_id.is_none() && !self.session_established {
+            // Stale carrier-up: no connect is pending and no
+            // session was ever established (e.g. assoc completed
+            // just before an abort's deauth reached the firmware).
+            // Raising the link here would open the data path with
+            // no keys installed, so force the firmware link back
+            // down instead and never surface the event.
+            self.r.stale.fetch_add(1, Ordering::Relaxed);
+            let _ = unsafe { nrf70_sys::disconnect(3) };
+        } else if up && self.secured && !self.port_authorized {
+            // Secured sessions are not usable until PORT_AUTHORIZED;
+            // hold the net link down and remember the radio numbers.
+            self.pending_link = Some((frequency_mhz, rssi_dbm));
+        } else {
+            self.set_link(up, frequency_mhz, rssi_dbm);
+            if up && let Some(id) = self.connect_id.take() {
+                self.session_established = true;
+                self.terminal(Response::Done { id, result: Ok(()) })
+            }
+        }
+    }
+    fn on_port_authorized(&mut self) {
+        self.port_authorized = true;
+        self.session_established = true;
+        let (frequency_mhz, rssi_dbm) = self.pending_link.take().unwrap_or((0, 0));
+        self.set_link(true, frequency_mhz, rssi_dbm);
+        if let Some(id) = self.connect_id.take() {
+            self.terminal(Response::Done { id, result: Ok(()) })
+        }
+    }
+    fn on_handshake_failed(&mut self, reason_code: u16) {
+        self.last_reason = reason_code;
+        self.clear_session();
+        if self.linked {
+            self.set_link(false, 0, 0);
+        } else {
+            // The net link never rose (the Link-up was parked
+            // during the handshake), so set_link would emit
+            // nothing; report the 802.11 reason code directly.
+            self.emit(LinkEvent::Down { reason_code });
+        }
+        if let Some(id) = self.connect_id.take() {
+            self.terminal(Response::Done {
+                id,
+                result: Err(Error::HandshakeFailed),
+            })
+        }
+    }
+    fn on_disconnected(&mut self, reason_code: u16) {
+        self.last_reason = reason_code;
+        self.clear_session();
+        if self.linked {
+            self.set_link(false, 0, 0);
+        } else if self.connect_id.is_some() {
+            // A connect failed before the net link ever rose;
+            // surface the reason code that set_link would swallow.
+            self.emit(LinkEvent::Down { reason_code });
+        }
+        if let Some(id) = self.connect_id.take() {
+            self.terminal(Response::Done {
+                id,
+                result: Err(Error::Io),
+            })
+        }
+    }
+    fn on_fatal(&mut self) {
+        self.emit(LinkEvent::Fatal);
+        self.fail_operations(Error::Fatal);
+        if self.initialized {
+            let _ = unsafe { nrf70_sys::deinit() };
+            self.initialized = false
+        }
+        self.clear_session();
+        self.set_link(false, 0, 0)
     }
     fn set_link(&mut self, up: bool, frequency: u16, rssi: i8) {
         if self.linked == up && (!up || frequency == 0) {

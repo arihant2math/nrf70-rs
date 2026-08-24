@@ -3,7 +3,7 @@ target = "thumbv8m.main-none-eabihf"
 cpu = "cortex-m33"
 float_abi = "hard"
 enum_width = "32-bit (-fno-short-enums)"
-clang = "21.0.0"
+clang = "21.1.8"
 
 [nrf70_bm]
 url = "https://github.com/nrfconnect/nrf70-bm.git"

@@ -1,5 +1,3 @@
-#![allow(clippy::mut_from_ref)]
-
 use crate::Arena;
 use core::{cell::UnsafeCell, ffi::c_char};
 
@@ -32,6 +30,15 @@ pub trait Bus {
     fn host_irq_active(&self) -> bool;
     fn log(&mut self, _level: u8, _message: *const c_char) {}
     fn fatal(&mut self, _reason: i32, _message: *const c_char) {}
+}
+
+/// Maps a `Bus` result onto the C ABI's 0/-1 convention.
+fn code<E>(result: Result<(), E>) -> i32 {
+    result.map(|_| 0).unwrap_or(-1)
+}
+/// The C side requires address, pointer, and length to be four-byte aligned.
+fn word_aligned(address: u32, buffer: &[u8]) -> bool {
+    ((address as usize) | (buffer.as_ptr() as usize) | buffer.len()) & 3 == 0
 }
 
 /// Rust-owned platform state: hardware tokens plus a dedicated bounded control arena.
@@ -70,13 +77,13 @@ unsafe impl<B: Bus + Send, const N: usize> nrf70_sys::Platform for Platform<B, N
         unsafe { self.arena.free(p) }
     }
     fn power_on(&self) -> i32 {
-        self.bus().power_on().map(|_| 0).unwrap_or(-1)
+        code(self.bus().power_on())
     }
     fn power_off(&self) {
         self.bus().power_off()
     }
     fn bus_init(&self) -> i32 {
-        self.bus().bus_init().map(|_| 0).unwrap_or(-1)
+        code(self.bus().bus_init())
     }
     fn bus_deinit(&self) {
         self.bus().bus_deinit()
@@ -91,25 +98,25 @@ unsafe impl<B: Bus + Send, const N: usize> nrf70_sys::Platform for Platform<B, N
         }
     }
     fn write_reg32(&self, a: u32, v: u32) -> i32 {
-        self.bus().write_reg32(a, v).map(|_| 0).unwrap_or(-1)
+        code(self.bus().write_reg32(a, v))
     }
     fn read(&self, a: u32, d: &mut [u8]) -> i32 {
-        if ((a as usize) | (d.as_ptr() as usize) | d.len()) & 3 != 0 {
+        if !word_aligned(a, d) {
             return -1;
         }
-        self.bus().read(a, d).map(|_| 0).unwrap_or(-1)
+        code(self.bus().read(a, d))
     }
     fn write(&self, a: u32, s: &[u8]) -> i32 {
-        if ((a as usize) | (s.as_ptr() as usize) | s.len()) & 3 != 0 {
+        if !word_aligned(a, s) {
             return -1;
         }
-        self.bus().write(a, s).map(|_| 0).unwrap_or(-1)
+        code(self.bus().write(a, s))
     }
     fn sleep(&self) -> i32 {
-        self.bus().sleep().map(|_| 0).unwrap_or(-1)
+        code(self.bus().sleep())
     }
     fn wake(&self) -> i32 {
-        self.bus().wake().map(|_| 0).unwrap_or(-1)
+        code(self.bus().wake())
     }
     fn power_status(&self) -> i32 {
         self.bus().power_status().unwrap_or(-1)
