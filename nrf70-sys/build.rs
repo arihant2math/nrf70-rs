@@ -8,11 +8,11 @@ use std::{
 
 const TARGET: &str = "thumbv8m.main-none-eabihf";
 const CLANG_VERSION: &str = "21.1.8";
-const BLOB_SHA256: &str = "36b84d10037a9609a2a0fe86a0ef5b53fcd5fc2e88621c6d8f0f711b76775b1e";
+const BLOB_SHA256: &str = "5a71780725e82feaf76363e0512157bf22a8c2d3c86cd8549928a7c289a27fe5";
 const LICENSE_SHA256: &str = "47d92141c69e74a0166c319a41e5005ce2b87f0498e5dbd5a0c5a34f9ef63954";
-const NRF70_BM_REV: &str = "185ec021afb61dc2d42b4f65800c3aa3d27c88d6";
-const NRF_WIFI_REV: &str = "0aaa9aa812877cb6bc020df8260d0607a3f0ec1a";
-const NRFXLIB_REV: &str = "f1591c62b301c2dc8d91308d43903de563f64d81";
+const NRF70_BM_REV: &str = "21b6ed5921c93732db926a79ea2232655e0f2805";
+const NRF_WIFI_REV: &str = "8e3a55124fa5e93f7a8fba5f5338e9d5a86d01fb";
+const NRFXLIB_REV: &str = "c2efece046154752d9b926bc9e319fd665fa371d";
 const HOSTAP_REV: &str = "d467a115b8fc20b8b7120937cb1d445dacebc6a1";
 
 const SOURCES: &[&str] = &[
