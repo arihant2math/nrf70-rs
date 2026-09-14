@@ -255,8 +255,8 @@ const PATCHES: &[Patch] = &[
                 "unsigned int event_len = 0;\n\tunsigned int facade_events_processed = 0;\n\n\twhile (facade_events_processed < 1) {",
             ),
             (
-                "nrf_wifi_osal_mem_free(event);\n\t\tevent = NULL;\n\t}\n\nout:",
-                "nrf_wifi_osal_mem_free(event);\n\t\tevent = NULL;\n\t\tfacade_events_processed++;\n\t}\n\tif (facade_events_processed == 1) {\n\t\tnrf_wifi_osal_tasklet_schedule(hal_dev_ctx->event_tasklet);\n\t}\n\nout:",
+                "nrf_wifi_osal_mem_free(event);\n\t\tevent = NULL;\n\t}\n\nout:\n\treturn status;",
+                "nrf_wifi_osal_mem_free(event);\n\t\tevent = NULL;\n\t\tfacade_events_processed++;\n\t}\n\tif (facade_events_processed == 1) {\n\t\tnrf_wifi_osal_tasklet_schedule(hal_dev_ctx->event_tasklet);\n\t}\n\nout:\n\treturn status;",
             ),
         ],
         marker: "facade_events_processed",
@@ -272,7 +272,10 @@ const PATCHES: &[Patch] = &[
             ),
             (
                 "\t\tnum_events++;\n\t}\n\nout:",
-                "\t\tnum_events++;\n\t\tfacade_events_fetched++;\n\t}\n\nout:",
+                // The caller acknowledges HOST_IRQ even if more events remain.
+                // Continue in software: waiting for another GPIO edge/level can
+                // strand the IFFLAGS response forever after a coalesced IRQ.
+                "\t\tnum_events++;\n\t\tfacade_events_fetched++;\n\t}\n\tif (facade_events_fetched == 1) {\n\t\textern void nrf70_facade_notify_host_irq(void);\n\t\tnrf70_facade_notify_host_irq();\n\t}\n\nout:",
             ),
         ],
         marker: "facade_events_fetched",
@@ -471,6 +474,7 @@ fn main() {
             if let Some(patch) = PATCHES.iter().find(|x| x.source == *s) {
                 let mut source = fs::read_to_string(&p).unwrap();
                 for (from, to) in patch.edits {
+                    assert_eq!(source.matches(from).count(), 1, "{}", patch.panic_msg);
                     source = source.replacen(from, to, 1);
                 }
                 if !source.contains(patch.marker) {

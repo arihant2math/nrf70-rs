@@ -82,6 +82,7 @@ pub enum Security {
     Open,
     Wpa2Personal,
     Wpa2Sha256,
+    /// Firmware display label; may be SAE-only or WPA2/WPA3 transition mode.
     Wpa3Sae,
     Other,
 }
@@ -208,8 +209,9 @@ pub enum Error {
     NotConnected,
     /// No scanned AP matched the requested SSID (and BSSID, when given).
     NotFound,
-    /// A matching AP was found but its security does not fit the credential
-    /// (WPA3-SAE and unknown suites are treated as incompatible today).
+    /// No matching display-scan candidate fits the credential. WPA3-labelled
+    /// candidates are checked for WPA2 transition mode during the connect
+    /// scan; SAE-only RSN rejection is reported as `HandshakeFailed`.
     IncompatibleSecurity,
     /// The 4-way handshake failed; the 802.11 reason code is reported through
     /// an accompanying `LinkEvent::Down` (emitted even when the net link
@@ -567,7 +569,9 @@ impl Wifi<'_> {
                 continue;
             }
             ssid_seen = true;
-            if !credential_compatible(ap.security, &request.credential) {
+            #[cfg(feature = "defmt")]
+            defmt::debug!("connect candidate: {}", defmt::Debug2Format(ap));
+            if !credential_candidate(ap.security, &request.credential) {
                 continue;
             }
             if best.is_none_or(|b| ap.rssi_dbm > b.rssi_dbm) {
@@ -635,9 +639,12 @@ impl Wifi<'_> {
             frequency_mhz,
             security: match security {
                 Security::Open => nrf70_sys::Security::Open,
-                Security::Wpa2Personal => nrf70_sys::Security::Wpa2Psk,
+                // Display scans label transition-mode APs as WPA3 too. Ask
+                // the C connect scan to inspect their RSN IE for PSK support;
+                // it must reject SAE-only APs before association.
+                Security::Wpa2Personal | Security::Wpa3Sae => nrf70_sys::Security::Wpa2Psk,
                 Security::Wpa2Sha256 => nrf70_sys::Security::Wpa2PskSha256,
-                Security::Wpa3Sae | Security::Other => return Err(Error::IncompatibleSecurity),
+                Security::Other => return Err(Error::IncompatibleSecurity),
             },
             mfp: match request.mfp {
                 Mfp::Disabled => nrf70_sys::MFP_DISABLED,
@@ -1252,12 +1259,14 @@ impl<B: Bus + Send + 'static, const N: usize> Runner<'_, B, N> {
         }
     }
 }
-fn credential_compatible(security: Security, credential: &Credential) -> bool {
+// This is only a display-scan prefilter. A WPA3 label may include WPA2 PSK
+// transition mode; the C connect scan validates the actual RSN AKMs/ciphers.
+fn credential_candidate(security: Security, credential: &Credential) -> bool {
     matches!(
         (security, credential),
         (Security::Open, Credential::Open)
             | (
-                Security::Wpa2Personal | Security::Wpa2Sha256,
+                Security::Wpa2Personal | Security::Wpa2Sha256 | Security::Wpa3Sae,
                 Credential::Passphrase(_) | Credential::Psk(_),
             )
     )
@@ -1267,5 +1276,23 @@ fn status_result(status: i32) -> Result<(), Error> {
         0 => Ok(()),
         -6 => Err(Error::Cancelled),
         _ => Err(Error::Io),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_scan_allows_transition_candidates_but_not_open_downgrades() {
+        let psk = Credential::Psk([0; 32]);
+        assert!(credential_candidate(Security::Wpa3Sae, &psk));
+        assert!(credential_candidate(Security::Wpa2Personal, &psk));
+        assert!(credential_candidate(Security::Wpa2Sha256, &psk));
+        assert!(!credential_candidate(Security::Open, &psk));
+        assert!(!credential_candidate(Security::Other, &psk));
+        assert!(credential_candidate(Security::Open, &Credential::Open));
+        assert!(!credential_candidate(Security::Wpa3Sae, &Credential::Open));
+        assert!(!credential_candidate(Security::Wpa2Personal, &Credential::Open));
     }
 }

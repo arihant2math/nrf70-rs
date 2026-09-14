@@ -4,6 +4,7 @@
 #include "osal_ops.h"
 #include "common/nrf70_bm_core.h"
 #include "system/fmac_api.h"
+#include "system/fmac_rx.h"
 #include "common/fmac_util.h"
 #include "util.h"
 #include <stdarg.h>
@@ -136,7 +137,7 @@ static void log_fmt_num(char*buf,size_t cap,size_t*w,unsigned long v,unsigned ba
     do{unsigned d=(unsigned)(v%base);tmp[i++]=(char)(d<10?'0'+d:(upper?'A':'a')+d-10);v/=base;}while(v&&i<sizeof(tmp));
     while(i)log_fmt_put(buf,cap,w,tmp[--i]);
 }
-static int log_fmt_err(const char *f,va_list a){
+static int log_fmt(uint8_t level,const char *f,va_list a){
     char buf[160];size_t w=0;
     for(const char*p=f;*p;p++){
         if(*p!='%'){log_fmt_put(buf,sizeof(buf),&w,*p);continue;}
@@ -159,9 +160,11 @@ static int log_fmt_err(const char *f,va_list a){
     /* Strip one trailing newline; the host log adds its own framing. */
     if(w&&w<=sizeof(buf)&&buf[w-1]=='\n')w--;
     buf[w<sizeof(buf)?w:sizeof(buf)-1]=0;
-    log_msg(3,buf);
+    log_msg(level,buf);
     return 0;
 }
+static int log_fmt_err(const char *f,va_list a){return log_fmt(3,f,a);}
+static void log_diag(const char *f,...){va_list a;va_start(a,f);log_fmt(0,f,a);va_end(a);}
 static unsigned int os_strlen(const void*s){return (unsigned int)nrf70_os_strlen((const char*)s);} static unsigned char rand8(void){return platform&&platform->random_u8?platform->random_u8(platform->context):0;}
 
 static void *lock_alloc(void){for(unsigned i=0;i<LOCK_SLOTS;i++)if(!locks[i].used){locks[i].used=1;locks[i].held=0;return &locks[i];}counters.allocation_failures++;fatal(NRF70_FACADE_NO_MEMORY,"Wi-Fi lock slots exhausted");return 0;}
@@ -241,8 +244,13 @@ static void write_mem(void*p,unsigned long a,const void*s,size_t n){
 static int ps_sleep(void*p){(void)p;return platform?platform->sleep(platform->context):-1;}static int ps_wake(void*p){(void)p;return platform?platform->wake(platform->context):-1;}static int ps_status(void*p){(void)p;return platform?platform->power_status(platform->context):-1;}
 static void os_assert(int t,int v,enum nrf_wifi_assert_op_type op,char*m){int ok=0;switch(op){case NRF_WIFI_ASSERT_EQUAL_TO:ok=t==v;break;case NRF_WIFI_ASSERT_NOT_EQUAL_TO:ok=t!=v;break;case NRF_WIFI_ASSERT_LESS_THAN:ok=t<v;break;case NRF_WIFI_ASSERT_LESS_THAN_EQUAL_TO:ok=t<=v;break;case NRF_WIFI_ASSERT_GREATER_THAN:ok=t>v;break;case NRF_WIFI_ASSERT_GREATER_THAN_EQUAL_TO:ok=t>=v;break;default:ok=0;}if(!ok)fatal(NRF70_FACADE_FATAL,m?m:"nrf_wifi assert");}
 
+/* Control lists and data-memory metadata use the same arena-backed helpers
+ * as ordinary lists and allocations. The vendor OSAL calls these separate
+ * hooks unconditionally; leaving them unset branches to NULL at startup. */
 const struct nrf_wifi_osal_ops nrf_wifi_os_bm_ops = {
  .mem_alloc=mem_alloc,.mem_zalloc=mem_zalloc,.mem_free=mem_free,.mem_cpy=nrf70_os_memcpy,.mem_set=nrf70_os_memset,.mem_cmp=nrf70_os_memcmp,
+ .data_mem_zalloc=mem_zalloc,.data_mem_free=mem_free,
+ .ctrl_llist_alloc=list_alloc,.ctrl_llist_free=list_free,.ctrl_llist_node_alloc=node_alloc,.ctrl_llist_node_free=node_free,
  .qspi_read_reg32=read32,.qspi_write_reg32=write32,.qspi_cpy_from=read_mem,.qspi_cpy_to=write_mem,
  .spinlock_alloc=lock_alloc,.spinlock_free=lock_free,.spinlock_init=lock_init,.spinlock_take=lock_take,.spinlock_rel=lock_rel,.spinlock_irq_take=lock_irq_take,.spinlock_irq_rel=lock_irq_rel,
  .log_dbg=log_drop,.log_info=log_drop,.log_err=log_fmt_err,
@@ -264,6 +272,7 @@ static void rx_frame_cb(void *vif,void *frm){(void)vif;struct nbuf*n=frm;if(!n)r
     uint16_t ethertype=((uint16_t)n->data[12]<<8)|n->data[13];
     if(ethertype==0x888Eu){
         uint16_t body=(uint16_t)(n->len-14u);
+        if(body>=7u)log_diag("EAPOL RX: len=%u type=%u key_info=%x state=%u",(unsigned)body,n->data[15],((unsigned)n->data[19]<<8)|n->data[20],conn.state);
         if(!conn.secured||body>EAPOL_MAX||eapol_count==EAPOL_SLOTS){counters.eapol_rx_dropped++;nbuf_free(n);return;}
         struct eapol_slot*s=&eapol_slots[eapol_write];
         s->length=body;nrf70_os_memcpy(s->src,n->data+6,6);nrf70_os_memcpy(s->frame,n->data+14,body);
@@ -277,8 +286,27 @@ static enum nrf_wifi_status carrier_cb(void*vif,enum nrf_wifi_fmac_if_carr_state
  * every field read must be covered by `len`; a short event is treated as a
  * failure (auth/assoc) or reported with reason 0 (disconnect). */
 #define MLME_FLAGS_LEN (offsetof(struct nrf_wifi_umac_event_mlme,nrf_wifi_flags)+sizeof(((struct nrf_wifi_umac_event_mlme*)0)->nrf_wifi_flags))
-static void auth_cb(void*vif,struct nrf_wifi_umac_event_mlme*e,unsigned int len){(void)vif;uint8_t ok=e&&len>=MLME_FLAGS_LEN&&!(e->nrf_wifi_flags&NRF_WIFI_EVENT_MLME_TIMED_OUT);if(conn.state==CONN_AUTH_WAIT){if(ok)conn.auth_ok=1;else conn.auth_fail=1;}push_simple(NRF70_FACADE_EVENT_AUTH,ok?0:NRF70_FACADE_IO);}
-static void assoc_cb(void*vif,struct nrf_wifi_umac_event_mlme*e,unsigned int len){(void)vif;uint8_t ok=e&&len>=MLME_FLAGS_LEN&&!(e->nrf_wifi_flags&NRF_WIFI_EVENT_MLME_TIMED_OUT);if(conn.state==CONN_ASSOC_WAIT){if(ok)conn.assoc_ok=1;else conn.assoc_fail=1;}push_simple(NRF70_FACADE_EVENT_ASSOC,ok?0:NRF70_FACADE_IO);}
+static uint16_t mlme_status(const struct nrf_wifi_umac_event_mlme *e, unsigned len, unsigned offset) {
+    if (!e || len < MLME_FLAGS_LEN || (e->nrf_wifi_flags & NRF_WIFI_EVENT_MLME_TIMED_OUT) ||
+        len < offsetof(struct nrf_wifi_umac_event_mlme, frame.frame) + offset + 2u ||
+        e->frame.frame_len < offset + 2u) return UINT16_MAX;
+    const uint8_t *frame = (const uint8_t *)e->frame.frame;
+    return (uint16_t)frame[offset] | ((uint16_t)frame[offset + 1] << 8);
+}
+static void auth_cb(void*vif,struct nrf_wifi_umac_event_mlme*e,unsigned int len){
+    (void)vif;
+    uint16_t status=mlme_status(e,len,28); /* 24-byte header, algorithm, transaction, status */
+    log_diag("auth response: status=%u",(unsigned)status);
+    if(conn.state==CONN_AUTH_WAIT){if(status==0)conn.auth_ok=1;else conn.auth_fail=1;}
+    push_simple(NRF70_FACADE_EVENT_AUTH,status==0?0:NRF70_FACADE_IO);
+}
+static void assoc_cb(void*vif,struct nrf_wifi_umac_event_mlme*e,unsigned int len){
+    (void)vif;
+    uint16_t status=mlme_status(e,len,26); /* 24-byte header, capabilities, status */
+    log_diag("assoc response: status=%u",(unsigned)status);
+    if(conn.state==CONN_ASSOC_WAIT){if(status==0)conn.assoc_ok=1;else conn.assoc_fail=1;}
+    push_simple(NRF70_FACADE_EVENT_ASSOC,status==0?0:NRF70_FACADE_IO);
+}
 static void disconnected_cb(void*vif,struct nrf_wifi_umac_event_mlme*e,unsigned int len){(void)vif;if(!callbacks_enabled)return;uint16_t reason=0;if(e&&len>=offsetof(struct nrf_wifi_umac_event_mlme,frame.frame)+26u&&e->frame.frame_len>=26){const uint8_t*f=(const uint8_t*)e->frame.frame;reason=(uint16_t)f[24]|((uint16_t)f[25]<<8);}counters.disconnects++;linked=0;if(conn.state!=CONN_IDLE)conn.teardown=1;struct nrf70_facade_event x={.generation=generation,.kind=NRF70_FACADE_EVENT_DISCONNECTED,.frequency_mhz=associated_frequency,.reason_code=reason};enqueue_event(&x,1);}
 static void rssi_cb(void*vif,signed short signal){(void)vif;if(signal<-128)current_rssi=-128;else if(signal>127)current_rssi=127;else current_rssi=(int8_t)signal;}
 static void recovery_cb(void*vif,void*event,unsigned int len){(void)vif;(void)event;(void)len;if(callbacks_enabled){counters.firmware_restarts++;push_simple(NRF70_FACADE_EVENT_FATAL,NRF70_FACADE_FATAL);}}
@@ -307,6 +335,8 @@ static void conn_capture_ie(const uint8_t *ies,uint32_t len,uint8_t id,uint8_t *
 static void connect_scan_res_cb(void *vif,struct nrf_wifi_umac_event_new_scan_results*r,unsigned int len,bool more){
     (void)vif;
     if(conn.state!=CONN_SCAN_WAIT){return;}
+    if(r&&len>=offsetof(struct nrf_wifi_umac_event_new_scan_results,ies))
+        log_diag("connect scan: len=%u flags=%x ies=%u beacon=%u more=%u bssid=%02x:%02x:%02x:%02x:%02x:%02x",len,r->valid_fields,r->ies_len,r->beacon_ies_len,(unsigned)more,r->mac_addr[0],r->mac_addr[1],r->mac_addr[2],r->mac_addr[3],r->mac_addr[4],r->mac_addr[5]);
     /* The RPU-declared ies_len/beacon_ies_len must fit inside the delivered
      * event (the HAL allocates exactly the declared message length); a
      * malformed event is ignored rather than parsed out of bounds. */
@@ -340,10 +370,84 @@ static void connect_scan_res_cb(void *vif,struct nrf_wifi_umac_event_new_scan_re
 static void fill_callbacks(struct nrf_wifi_fmac_callbk_fns*c){nrf70_os_memset(c,0,sizeof(*c));c->rpu_recovery_callbk_fn=recovery_cb;c->scan_start_callbk_fn=scan_start_cb;c->scan_done_callbk_fn=scan_done_cb;c->scan_abort_callbk_fn=scan_abort_cb;c->disp_scan_res_callbk_fn=scan_results_cb;c->scan_res_callbk_fn=connect_scan_res_cb;c->event_get_reg=get_reg_cb;c->reg_change_callbk_fn=reg_change_cb;c->if_carr_state_chg_callbk_fn=carrier_cb;c->rx_frm_callbk_fn=rx_frame_cb;c->auth_resp_callbk_fn=auth_cb;c->assoc_resp_callbk_fn=assoc_cb;c->deauth_callbk_fn=disconnected_cb;c->disassoc_callbk_fn=disconnected_cb;c->process_rssi_from_rx=rssi_cb;}
 
 static void fmac_stop(void){callbacks_enabled=0;if(fmac_dev&&sta_vif_idx<MAX_NUM_VIFS){struct nrf_wifi_umac_chg_vif_state_info v={0};v.state=NRF_WIFI_FMAC_IF_OP_STATE_DOWN;v.if_index=sta_vif_idx;nrf_wifi_sys_fmac_chg_vif_state(fmac_dev,sta_vif_idx,&v);nrf_wifi_sys_fmac_del_vif(fmac_dev,sta_vif_idx);}if(fmac_dev)nrf_wifi_sys_fmac_dev_deinit(fmac_dev);if(fmac_dev)nrf_wifi_fmac_dev_rem(fmac_dev);if(fmac_priv)nrf_wifi_fmac_deinit(fmac_priv);nrf_wifi_osal_deinit();fmac_dev=0;fmac_priv=0;sta_vif_idx=MAX_NUM_VIFS;}
-static int fmac_start(const uint8_t mac[6],const uint8_t country[2]){struct nrf_wifi_data_config_params data={0};struct rx_buf_pool_params rx[MAX_NUM_OF_RX_QUEUES]={0};struct nrf_wifi_fmac_callbk_fns callbacks;struct nrf_wifi_tx_pwr_ctrl_params power={0};struct nrf_wifi_tx_pwr_ceil_params ceilings;struct nrf_wifi_board_params board={0};unsigned char alpha2[3]={country[0],country[1],0};data.max_tx_aggregation=1;data.reorder_buf_size=1;/* The system-mode firmware runs all MAX_NUM_OF_RX_QUEUES RX queues and is told each pool's geometry via cmd_sys_init; a zero-buffer pool wedges the RPU at interface-up (scan-only firmware tolerates it, this one does not), so feed every queue. NRF70_RX_NUM_BUFS is the TOTAL across queues — the HAL reserves exactly NRF70_RX_NUM_BUFS*NRF70_RX_MAX_DATA_SIZE at the end of PKTRAM (hal_api.c) and a larger sum overruns packet RAM. */_Static_assert(NRF70_RX_NUM_BUFS%MAX_NUM_OF_RX_QUEUES==0,"NRF70_RX_NUM_BUFS must split evenly across the RX queues");for(unsigned i=0;i<MAX_NUM_OF_RX_QUEUES;i++){rx[i].num_bufs=NRF70_RX_NUM_BUFS/MAX_NUM_OF_RX_QUEUES;rx[i].buf_sz=NRF70_RX_MAX_DATA_SIZE;}fill_callbacks(&callbacks);nrf_wifi_osal_init(&nrf_wifi_os_bm_ops);fmac_priv=nrf_wifi_sys_fmac_init(&data,rx,&callbacks);if(!fmac_priv)goto fail;fmac_dev=nrf_wifi_sys_fmac_dev_add(fmac_priv,(void*)platform);if(!fmac_dev)goto fail;if(nrf70_bm_fw_load(fmac_dev,(const uint8_t*)_bin_nrf70_facade_fw_start,(const uint8_t*)_bin_nrf70_facade_fw_end)!=NRF_WIFI_STATUS_SUCCESS)goto fail;nrf70_bm_conf_tx_pwr_settings(&power,&ceilings);nrf70_bm_conf_board_dep_params(&board);if(nrf_wifi_sys_fmac_dev_init(fmac_dev,HW_SLEEP_ENABLE,NRF_WIFI_DEF_PHY_CALIB,CONFIG_NRF_WIFI_OP_BAND,true,&power,&ceilings,&board,alpha2)!=NRF_WIFI_STATUS_SUCCESS)goto fail;struct nrf_wifi_umac_add_vif_info add={0};add.iftype=NRF_WIFI_IFTYPE_STATION;nrf70_os_memcpy(add.ifacename,"wlan0",5);sta_vif_idx=nrf_wifi_sys_fmac_add_vif(fmac_dev,(void*)platform,&add);if(sta_vif_idx>=MAX_NUM_VIFS)goto fail;nrf70_os_memcpy(sta_mac,mac,6);if(nrf_wifi_sys_fmac_set_vif_macaddr(fmac_dev,sta_vif_idx,sta_mac)!=NRF_WIFI_STATUS_SUCCESS)goto fail;struct nrf_wifi_umac_chg_vif_state_info up={0};up.state=NRF_WIFI_FMAC_IF_OP_STATE_UP;up.if_index=sta_vif_idx;if(nrf_wifi_sys_fmac_chg_vif_state(fmac_dev,sta_vif_idx,&up)!=NRF_WIFI_STATUS_SUCCESS)goto fail;callbacks_enabled=1;return 0;fail:fmac_stop();return -1;}
+static int fmac_start(const uint8_t mac[6], const uint8_t country[2]) {
+    struct nrf_wifi_data_config_params data = {0};
+    struct rx_buf_pool_params rx[MAX_NUM_OF_RX_QUEUES] = {0};
+    struct nrf_wifi_fmac_callbk_fns callbacks;
+    struct nrf_wifi_tx_pwr_ctrl_params power = {0};
+    struct nrf_wifi_tx_pwr_ceil_params ceilings;
+    struct nrf_wifi_board_params board = {0};
+    unsigned char alpha2[3] = {country[0], country[1], 0};
+    const char *stage = "init: creating FMAC";
+    data.max_tx_aggregation = 1;
+    data.reorder_buf_size = 1;
+    /* Feed every system-mode RX queue. The HAL reserves NUM_BUFS *
+     * MAX_DATA_SIZE bytes, but FMAC adds RX_BUF_HEADROOM to each payload
+     * size when laying out the pools. Include that headroom in the budget,
+     * otherwise the last buffer extends beyond the end of packet RAM. */
+    _Static_assert(NRF70_RX_NUM_BUFS % MAX_NUM_OF_RX_QUEUES == 0,
+                   "RX buffers must split evenly across the queues");
+    _Static_assert(NRF70_RX_MAX_DATA_SIZE >= NRF70_FACADE_MAX_FRAME_LEN + RX_BUF_HEADROOM,
+                   "RX slot must hold an Ethernet frame plus descriptor headroom");
+    for (unsigned i = 0; i < MAX_NUM_OF_RX_QUEUES; i++) {
+        rx[i].num_bufs = NRF70_RX_NUM_BUFS / MAX_NUM_OF_RX_QUEUES;
+        rx[i].buf_sz = NRF70_RX_MAX_DATA_SIZE - RX_BUF_HEADROOM;
+    }
+    fill_callbacks(&callbacks);
+    log_msg(1, stage);
+    nrf_wifi_osal_init(&nrf_wifi_os_bm_ops);
+    fmac_priv = nrf_wifi_sys_fmac_init(&data, rx, &callbacks);
+    if (!fmac_priv) goto fail;
+    stage = "init: adding device (power and SPI)";
+    log_msg(1, stage);
+    fmac_dev = nrf_wifi_sys_fmac_dev_add(fmac_priv, (void *)platform);
+    if (!fmac_dev) goto fail;
+    stage = "init: loading firmware";
+    log_msg(1, stage);
+    if (nrf70_bm_fw_load(fmac_dev, (const uint8_t *)_bin_nrf70_facade_fw_start,
+                        (const uint8_t *)_bin_nrf70_facade_fw_end) != NRF_WIFI_STATUS_SUCCESS)
+        goto fail;
+    nrf70_bm_conf_tx_pwr_settings(&power, &ceilings);
+    nrf70_bm_conf_board_dep_params(&board);
+    stage = "init: initializing firmware and RX pools";
+    log_msg(1, stage);
+    if (nrf_wifi_sys_fmac_dev_init(fmac_dev, HW_SLEEP_ENABLE, NRF_WIFI_DEF_PHY_CALIB,
+                                  CONFIG_NRF_WIFI_OP_BAND, true, &power, &ceilings,
+                                  &board, alpha2) != NRF_WIFI_STATUS_SUCCESS)
+        goto fail;
+    struct nrf_wifi_umac_add_vif_info add = {0};
+    add.iftype = NRF_WIFI_IFTYPE_STATION;
+    nrf70_os_memcpy(add.ifacename, "wlan0", 5);
+    stage = "init: adding station interface";
+    log_msg(1, stage);
+    sta_vif_idx = nrf_wifi_sys_fmac_add_vif(fmac_dev, (void *)platform, &add);
+    if (sta_vif_idx >= MAX_NUM_VIFS) goto fail;
+    nrf70_os_memcpy(sta_mac, mac, 6);
+    stage = "init: setting station MAC";
+    log_msg(1, stage);
+    if (nrf_wifi_sys_fmac_set_vif_macaddr(fmac_dev, sta_vif_idx, sta_mac) != NRF_WIFI_STATUS_SUCCESS)
+        goto fail;
+    struct nrf_wifi_umac_chg_vif_state_info up = {0};
+    up.state = NRF_WIFI_FMAC_IF_OP_STATE_UP;
+    up.if_index = sta_vif_idx;
+    stage = "init: waiting for interface-up acknowledgement";
+    log_msg(1, stage);
+    if (nrf_wifi_sys_fmac_chg_vif_state(fmac_dev, sta_vif_idx, &up) != NRF_WIFI_STATUS_SUCCESS)
+        goto fail;
+    callbacks_enabled = 1;
+    log_msg(1, "init: station interface ready");
+    return 0;
+fail:
+    log_msg(3, stage);
+    log_msg(3, "init failed; tearing down (interface-down may also time out)");
+    fmac_stop();
+    return -1;
+}
 int32_t nrf70_facade_init(const struct nrf70_facade_platform_ops*ops,const uint8_t mac[6],const uint8_t country[2]){if(initialized||!ops||ops->abi_version!=NRF70_FACADE_ABI_VERSION||!mac||!country)return NRF70_FACADE_INVALID;platform=ops;reset_runtime();generation++;counters.generation=generation;uint32_t s=now_us();int r=fmac_start(mac,country);account_call(s);if(r||faulted){int32_t error=faulted?NRF70_FACADE_FATAL:NRF70_FACADE_IO;reset_runtime();platform=0;return error;}initialized=1;return 0;}
-int32_t nrf70_facade_deinit(void){if(!initialized)return NRF70_FACADE_NOT_INITIALIZED;callbacks_enabled=0;scan_active=0;irq_callback=0;conn_teardown_now();uint32_t s=now_us();fmac_stop();account_call(s);initialized=0;reset_runtime();platform=0;return 0;}
-int32_t nrf70_facade_reset(const uint8_t mac[6],const uint8_t country[2]){if(!initialized)return NRF70_FACADE_NOT_INITIALIZED;if(!mac||!country)return NRF70_FACADE_INVALID;callbacks_enabled=0;scan_active=0;irq_callback=0;conn_teardown_now();uint32_t s=now_us();fmac_stop();account_call(s);reset_runtime();generation++;counters.generation=generation;counters.resets++;s=now_us();int r=fmac_start(mac,country);account_call(s);if(r||faulted){initialized=0;return NRF70_FACADE_FATAL;}counters.firmware_restarts++;push_simple(NRF70_FACADE_EVENT_FIRMWARE_RESTART,0);return 0;}
+/* Keep the internal IRQ callback until FMAC finishes its synchronous
+ * interface-down request. bus_dev_deinit unregisters it afterwards. */
+int32_t nrf70_facade_deinit(void){if(!initialized)return NRF70_FACADE_NOT_INITIALIZED;callbacks_enabled=0;scan_active=0;conn_teardown_now();uint32_t s=now_us();fmac_stop();account_call(s);initialized=0;reset_runtime();platform=0;return 0;}
+int32_t nrf70_facade_reset(const uint8_t mac[6],const uint8_t country[2]){if(!initialized)return NRF70_FACADE_NOT_INITIALIZED;if(!mac||!country)return NRF70_FACADE_INVALID;callbacks_enabled=0;scan_active=0;conn_teardown_now();uint32_t s=now_us();fmac_stop();account_call(s);reset_runtime();generation++;counters.generation=generation;counters.resets++;s=now_us();int r=fmac_start(mac,country);account_call(s);if(r||faulted){initialized=0;return NRF70_FACADE_FATAL;}counters.firmware_restarts++;push_simple(NRF70_FACADE_EVENT_FIRMWARE_RESTART,0);return 0;}
 int32_t nrf70_facade_set_country(const uint8_t c[2]){if(!initialized)return NRF70_FACADE_NOT_INITIALIZED;if(!c)return NRF70_FACADE_INVALID;struct nrf_wifi_fmac_reg_info reg={0};reg.alpha2[0]=c[0];reg.alpha2[1]=c[1];reg.force=true;uint32_t s=now_us();enum nrf_wifi_status r=nrf_wifi_fmac_set_reg(fmac_dev,&reg);account_call(s);return faulted?NRF70_FACADE_FATAL:(r==NRF_WIFI_STATUS_SUCCESS?0:NRF70_FACADE_IO);}
 int32_t nrf70_facade_scan_start(const struct nrf70_facade_scan_request*q){if(!initialized)return NRF70_FACADE_NOT_INITIALIZED;if(scan_active||(conn.state!=CONN_IDLE&&conn.state!=CONN_AUTHORIZED))return NRF70_FACADE_BUSY;if(!q||q->channel_count>32||q->ssid_len>=32)return NRF70_FACADE_INVALID;/* The pinned nrf_wifi_sys_fmac_scan copies sizeof(info)+sizeof(struct nrf_wifi_channel)*num_scan_channels bytes from this buffer, so reserve a zeroed nrf_wifi_channel-sized area per channel; only the leading unsigned int frequencies are meaningful on the wire (upstream semantics), the rest is zeroed facade-owned slack the FMAC over-copy may read. */struct __attribute__((packed)){struct nrf_wifi_umac_scan_info info;union{unsigned int frequency[NRF70_FACADE_MAX_CHANNELS];unsigned char reserve[sizeof(struct nrf_wifi_channel)*NRF70_FACADE_MAX_CHANNELS];}ch;}scan={0};scan.info.scan_reason=SCAN_DISPLAY;scan.info.scan_params.passive_scan=q->passive;scan.info.scan_params.bands=NRF_WIFI_SCAN_BAND_5GHZ;scan.info.scan_params.dwell_time_active=q->dwell_active_ms;scan.info.scan_params.dwell_time_passive=q->dwell_passive_ms;if(q->ssid_len){scan.info.scan_params.num_scan_ssids=1;scan.info.scan_params.scan_ssids[0].nrf_wifi_ssid_len=q->ssid_len;nrf70_os_memcpy(scan.info.scan_params.scan_ssids[0].nrf_wifi_ssid,q->ssid,q->ssid_len);}for(unsigned i=0;i<q->channel_count;i++){if(q->channels[i].band!=1)return NRF70_FACADE_INVALID;int f=nrf_wifi_utils_chan_to_freq(NRF_WIFI_BAND_5GHZ,q->channels[i].channel);if(f<0)return NRF70_FACADE_INVALID;scan.ch.frequency[i]=(unsigned int)f;}scan.info.scan_params.num_scan_channels=q->channel_count;scan_active=1;scan_suppress=0;scan_result_count=0;scan_max_results=q->max_results;counters.scans_started++;uint32_t s=now_us();scan_command_active=1;enum nrf_wifi_status r=nrf_wifi_sys_fmac_scan(fmac_dev,sta_vif_idx,&scan.info);scan_command_active=0;account_call(s);if(r!=NRF_WIFI_STATUS_SUCCESS||faulted){scan_active=0;return faulted?NRF70_FACADE_FATAL:NRF70_FACADE_IO;}return 0;}
 int32_t nrf70_facade_scan_cancel(void){if(!scan_active)return NRF70_FACADE_INVALID;scan_active=0;scan_suppress=1;counters.scans_cancelled++;nrf_wifi_sys_fmac_abort_scan(fmac_dev,sta_vif_idx);struct nrf70_facade_event e={.generation=generation,.status=NRF70_FACADE_CANCELLED,.kind=NRF70_FACADE_EVENT_SCAN_COMPLETE};enqueue_event(&e,1);return 0;}
@@ -357,22 +461,25 @@ static void conn_fail(uint16_t reason){conn_fail_ex(NRF70_FACADE_IO,reason);}
  * PSK / PSK-SHA256), optional RSN capabilities (MFPC/MFPR). Every read is
  * bounds-checked; returns non-zero on any malformed structure. Trailing
  * fields (PMKID list, group mgmt suite) are ignored. */
-struct conn_rsn_info { uint8_t has_psk, has_psk_sha256, mfpc, mfpr; };
+struct conn_rsn_info { uint8_t has_psk, has_psk_sha256, group_ccmp, pairwise_ccmp, mfpc, mfpr; };
+static int rsn_suite_is_ccmp(const uint8_t *s){return s[0]==0&&s[1]==0x0f&&s[2]==0xac&&s[3]==4;}
 static int conn_parse_rsn(const uint8_t *ie,uint16_t ie_len,struct conn_rsn_info *out){
     nrf70_os_memset(out,0,sizeof(*out));
-    if(!ie||ie_len<4u||ie[0]!=48u)return -1;
+    if(!ie||ie_len<4u||ie[0]!=48u||(uint16_t)ie[1]+2u!=ie_len)return -1;
     const uint8_t *p=ie+2;uint16_t len=(uint16_t)(ie_len-2u),off=0;
     if(((uint16_t)p[0]|((uint16_t)p[1]<<8))!=1u)return -1; /* RSN version */
     off=2;
     if((uint16_t)(len-off)<4u)return -1; /* group data cipher suite */
+    out->group_ccmp=rsn_suite_is_ccmp(p+off);
     off=(uint16_t)(off+4u);
     if((uint16_t)(len-off)<2u)return -1;
     uint16_t pairwise_count=(uint16_t)p[off]|((uint16_t)p[off+1]<<8);off=(uint16_t)(off+2u);
-    if(pairwise_count>(uint16_t)((len-off)/4u))return -1;
+    if(!pairwise_count||pairwise_count>(uint16_t)((len-off)/4u))return -1;
+    for(uint16_t i=0;i<pairwise_count;i++)if(rsn_suite_is_ccmp(p+off+i*4u))out->pairwise_ccmp=1;
     off=(uint16_t)(off+pairwise_count*4u);
     if((uint16_t)(len-off)<2u)return -1;
     uint16_t akm_count=(uint16_t)p[off]|((uint16_t)p[off+1]<<8);off=(uint16_t)(off+2u);
-    if(akm_count>(uint16_t)((len-off)/4u))return -1;
+    if(!akm_count||akm_count>(uint16_t)((len-off)/4u))return -1;
     for(uint16_t i=0;i<akm_count;i++){
         const uint8_t *s=p+off+i*4u;
         if(s[0]==0x00&&s[1]==0x0F&&s[2]==0xAC){
@@ -434,15 +541,23 @@ int32_t nrf70_supp_host_ether_send(const uint8_t dst[6],uint16_t proto,const uin
     if(!d){nbuf_free(n);counters.eapol_tx_failed++;return NRF70_FACADE_NO_MEMORY;}
     nrf70_os_memcpy(d,dst,6);nrf70_os_memcpy(d+6,sta_mac,6);d[12]=(uint8_t)(proto>>8);d[13]=(uint8_t)proto;
     nrf70_os_memcpy(d+14,buf,len);
+    if(len>=7u)log_diag("EAPOL TX: len=%u type=%u key_info=%x",(unsigned)len,buf[1],((unsigned)buf[5]<<8)|buf[6]);
     if(nrf_wifi_fmac_start_xmit(rpu_ctx(),vif_idx(),n)!=NRF_WIFI_STATUS_SUCCESS){counters.eapol_tx_failed++;return NRF70_FACADE_IO;}
     counters.eapol_tx++;
     return 0;
 }
+static enum nrf_wifi_status conn_deauth(uint16_t reason) {
+    struct nrf_wifi_umac_disconn_info d = {0};
+    d.reason_code = reason;
+    /* FMAC sets MAC_ADDR_VALID only for a nonzero peer. Without it the
+     * command can return success without disconnecting the station. */
+    nrf70_os_memcpy(d.mac_addr, conn.secured ? conn.found_bssid : conn.bssid, 6);
+    return nrf_wifi_sys_fmac_deauth(rpu_ctx(), vif_idx(), &d);
+}
 void nrf70_supp_host_deauth(uint16_t reason_code){
     if(conn.state==CONN_IDLE)return;
     conn_fail(reason_code);
-    struct nrf_wifi_umac_disconn_info d={0};d.reason_code=reason_code;
-    nrf_wifi_sys_fmac_deauth(rpu_ctx(),vif_idx(),&d);
+    conn_deauth(reason_code);
 }
 void nrf70_supp_host_completed(uint8_t rekey){
     if(rekey){counters.rekeys++;return;}
@@ -468,7 +583,7 @@ static uint32_t conn_step(void){
     case CONN_DERIVE:{
         int32_t r=nrf70_supp_pbkdf2_step(conn.pmk);
         if(r<0)conn_fail(1);
-        else if(r==1){conn.pmk_ready=1;conn.state=CONN_SCAN_START;}
+        else if(r==1){log_msg(1,"connect: PMK derived; fetching AP RSN IE");conn.pmk_ready=1;conn.state=CONN_SCAN_START;}
         break;}
     case CONN_SCAN_START:{
         /* Same over-copy contract as nrf70_facade_scan_start: the FMAC reads
@@ -481,6 +596,8 @@ static uint32_t conn_step(void){
         scan.info.scan_params.scan_ssids[0].nrf_wifi_ssid_len=conn.ssid_len;
         nrf70_os_memcpy(scan.info.scan_params.scan_ssids[0].nrf_wifi_ssid,conn.ssid,conn.ssid_len);
         scan.info.scan_params.num_scan_channels=1;
+        scan.info.scan_params.dwell_time_active=50;
+        scan.info.scan_params.dwell_time_passive=130;
         scan.ch.frequency[0]=conn.frequency;
         scan_command_active=1;
         enum nrf_wifi_status r=nrf_wifi_sys_fmac_scan(rpu_ctx(),vif_idx(),&scan.info);
@@ -490,10 +607,11 @@ static uint32_t conn_step(void){
         break;}
     case CONN_SCAN_WAIT:
         if(conn.scan_fetch){conn.scan_fetch=0;if(nrf_wifi_sys_fmac_scan_res_get(rpu_ctx(),vif_idx(),SCAN_CONNECT)!=NRF_WIFI_STATUS_SUCCESS)conn_fail(1);}
-        else if(conn.scan_done){if(!conn.rsn_ie_len)conn_fail(1);else conn.state=CONN_AUTH_START;}
+        else if(conn.scan_done){if(!conn.rsn_ie_len){log_msg(3,"connect: no AP RSN IE received");conn_fail(1);}else conn.state=CONN_AUTH_START;}
         else did=0;
         break;
     case CONN_AUTH_START:{
+        log_msg(1,"connect: authenticating");
         struct nrf_wifi_umac_auth_info a={0};
         a.frequency=conn.frequency;
         a.auth_type=NRF_WIFI_AUTHTYPE_OPEN_SYSTEM;
@@ -517,6 +635,10 @@ static uint32_t conn_step(void){
                 secure_zero(conn.pmk,sizeof(conn.pmk));conn.pmk_ready=0;
                 conn_fail_ex(NRF70_FACADE_INVALID,0);break; /* malformed AP RSN IE */
             }
+            if(!rsn.group_ccmp||!rsn.pairwise_ccmp){
+                log_msg(3,"connect: AP does not support the required CCMP ciphers");
+                secure_zero(conn.pmk,sizeof(conn.pmk));conn.pmk_ready=0;conn_fail(0);break;
+            }
             /* MFP policy vs AP capability: Required needs MFPC; an AP with
              * MFPR cannot be joined with MFP disabled. */
             if((conn.mfp==2&&!rsn.mfpc)||(rsn.mfpr&&conn.mfp==0)){
@@ -528,7 +650,8 @@ static uint32_t conn_step(void){
             uint8_t akm_sha256;
             if(rsn.has_psk)akm_sha256=0;
             else if(rsn.has_psk_sha256)akm_sha256=1;
-            else{secure_zero(conn.pmk,sizeof(conn.pmk));conn.pmk_ready=0;conn_fail(0);break;}
+            else{log_msg(3,"connect: AP RSN offers no PSK AKM (SAE-only/enterprise unsupported)");secure_zero(conn.pmk,sizeof(conn.pmk));conn.pmk_ready=0;conn_fail(0);break;}
+            log_msg(1,akm_sha256?"connect: RSN accepts PSK-SHA256":"connect: RSN accepts WPA2-PSK");
             conn.assoc_ie_len=NRF70_SUPP_ASSOC_IE_MAX;
             int32_t r=nrf70_supp_start(sta_mac,conn.found_bssid,conn.pmk,conn.mfp,akm_sha256,conn.rsn_ie,conn.rsn_ie_len,conn.rsnxe_len?conn.rsnxe:0,conn.rsnxe_len,conn.assoc_ie,&conn.assoc_ie_len);
             secure_zero(conn.pmk,sizeof(conn.pmk));/* wpa_sm keeps the PMK for rekeying */
@@ -545,6 +668,7 @@ static uint32_t conn_step(void){
         a.ssid.nrf_wifi_ssid_len=conn.ssid_len;
         nrf70_os_memcpy(a.ssid.nrf_wifi_ssid,conn.ssid,conn.ssid_len);
         nrf70_os_memcpy(a.nrf_wifi_bssid,conn.secured?conn.found_bssid:conn.bssid,6);
+        log_msg(1,"connect: associating");
         if(nrf_wifi_sys_fmac_assoc(rpu_ctx(),vif_idx(),&a)!=NRF_WIFI_STATUS_SUCCESS)conn_fail(1);
         else conn.state=CONN_ASSOC_WAIT;
         break;}
@@ -552,7 +676,7 @@ static uint32_t conn_step(void){
         if(conn.assoc_fail)conn.teardown=1;/* ASSOC event already carries the failure */
         else if(conn.assoc_ok){
             conn.assoc_ok=0;
-            if(conn.secured){nrf70_supp_notify_assoc(conn.found_bssid);conn.state=CONN_HANDSHAKE;}
+            if(conn.secured){log_msg(1,"connect: associated; waiting for EAPOL handshake");nrf70_supp_notify_assoc(conn.found_bssid);conn.state=CONN_HANDSHAKE;}
             else conn.state=CONN_AUTHORIZED;/* open completion is LINK up */
         }else did=0;
         break;
@@ -613,11 +737,11 @@ int32_t nrf70_facade_connect_start(const struct nrf70_facade_connect_request*q){
 int32_t nrf70_facade_connect_abort(uint16_t reason){
     if(!initialized)return NRF70_FACADE_NOT_INITIALIZED;
     if(conn.state==CONN_IDLE)return NRF70_FACADE_NOT_CONNECTED;
-    if(conn.state>=CONN_AUTH_WAIT||linked){struct nrf_wifi_umac_disconn_info d={0};d.reason_code=reason;nrf_wifi_sys_fmac_deauth(rpu_ctx(),vif_idx(),&d);}
+    if(conn.state>=CONN_AUTH_WAIT||linked)conn_deauth(reason);
     conn_teardown_now();
     return 0;
 }
-int32_t nrf70_facade_disconnect(uint16_t reason){if(!initialized)return NRF70_FACADE_NOT_INITIALIZED;struct nrf_wifi_umac_disconn_info d={0};d.reason_code=reason;uint32_t s=now_us();enum nrf_wifi_status r=nrf_wifi_sys_fmac_deauth(rpu_ctx(),vif_idx(),&d);account_call(s);conn_teardown_now();return r==NRF_WIFI_STATUS_SUCCESS?0:NRF70_FACADE_IO;}
+int32_t nrf70_facade_disconnect(uint16_t reason){if(!initialized)return NRF70_FACADE_NOT_INITIALIZED;uint32_t s=now_us();enum nrf_wifi_status r=conn_deauth(reason);account_call(s);conn_teardown_now();return r==NRF_WIFI_STATUS_SUCCESS?0:NRF70_FACADE_IO;}
 static int convert_key(const struct nrf70_facade_key*k,struct nrf_wifi_umac_key_info*out){if(!k||k->key_type>NRF70_FACADE_KEY_PEER||k->key_len>NRF70_FACADE_MAX_KEY_LEN||k->seq_len>NRF70_FACADE_MAX_SEQ_LEN)return 0;nrf70_os_memset(out,0,sizeof(*out));out->key_type=k->key_type;out->key_idx=k->key_index;out->cipher_suite=k->cipher_suite;out->key.nrf_wifi_key_len=k->key_len;nrf70_os_memcpy(out->key.nrf_wifi_key,k->key,k->key_len);out->seq.nrf_wifi_seq_len=k->seq_len;nrf70_os_memcpy(out->seq.nrf_wifi_seq,k->sequence,k->seq_len);out->valid_fields=NRF_WIFI_KEY_VALID|NRF_WIFI_KEY_TYPE_VALID|NRF_WIFI_KEY_IDX_VALID|NRF_WIFI_CIPHER_SUITE_VALID;if(k->seq_len)out->valid_fields|=NRF_WIFI_SEQ_VALID;return 1;}
 int32_t nrf70_facade_key_install(const struct nrf70_facade_key*k){if(!initialized)return NRF70_FACADE_NOT_INITIALIZED;struct nrf_wifi_umac_key_info i;if(!convert_key(k,&i))return NRF70_FACADE_INVALID;return nrf_wifi_sys_fmac_add_key(rpu_ctx(),vif_idx(),&i,(const char*)k->peer)==NRF_WIFI_STATUS_SUCCESS?0:NRF70_FACADE_IO;}
 int32_t nrf70_facade_key_remove(const struct nrf70_facade_key*k){if(!initialized)return NRF70_FACADE_NOT_INITIALIZED;struct nrf_wifi_umac_key_info i;if(!convert_key(k,&i))return NRF70_FACADE_INVALID;return nrf_wifi_sys_fmac_del_key(rpu_ctx(),vif_idx(),&i,(const char*)k->peer)==NRF_WIFI_STATUS_SUCCESS?0:NRF70_FACADE_IO;}

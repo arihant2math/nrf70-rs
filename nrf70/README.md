@@ -55,8 +55,12 @@ blocking SPIM only; never bridge a C callback to an async future.
 - WPA2-Personal with CCMP/AES only (passphrase or raw 32-byte PSK), plus open
   networks. WPA2-PSK-SHA256 APs are supported: the AKM is actually chosen
   from the AP's RSN IE by the supplicant, and mixed PSK/PSK-SHA256 APs use
-  plain PSK. WPA3-SAE and mandatory PMF are pending; scan results that
-  require them are rejected with `Error::IncompatibleSecurity`.
+  plain PSK. WPA2/WPA3 transition-mode APs are supported via WPA2, even
+  when display scans label them as WPA3. The connect scan validates the
+  actual RSN IE for a PSK AKM and CCMP group/pairwise ciphers before
+  association; SAE-only APs are rejected (`Error::HandshakeFailed`).
+  SAE itself is not implemented. Required-PMF interoperability remains
+  unqualified on hardware; the tested configuration uses optional PMF.
 - `Bus::random_u8` is the sole entropy source for WPA2 nonce generation (the
   EAPOL-Key SNonce) and MUST be backed by a cryptographically secure TRNG
   (the CRACEN-backed entropy service on the target board); a counter or weak
