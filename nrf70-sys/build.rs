@@ -7,7 +7,7 @@ use std::{
 };
 
 const TARGET: &str = "thumbv8m.main-none-eabihf";
-const CLANG_VERSION: &str = "21.1.8";
+const CLANG_MAJOR_VERSION: &str = "21";
 const BLOB_SHA256: &str = "5a71780725e82feaf76363e0512157bf22a8c2d3c86cd8549928a7c289a27fe5";
 const LICENSE_SHA256: &str = "47d92141c69e74a0166c319a41e5005ce2b87f0498e5dbd5a0c5a34f9ef63954";
 const NRF70_BM_REV: &str = "21b6ed5921c93732db926a79ea2232655e0f2805";
@@ -428,11 +428,15 @@ fn main() {
             .output()
             .expect("pinned Clang 21 is required");
         let version = String::from_utf8_lossy(&clang.stdout);
-        if !version.lines().next().unwrap_or("").contains(CLANG_VERSION) {
-            panic!(
-                "Clang {CLANG_VERSION} is pinned, found: {}",
-                version.lines().next().unwrap_or("unknown")
-            );
+        let first_line = version.lines().next().unwrap_or("unknown");
+        // "Homebrew clang version 21.1.8", "Ubuntu clang version 21.1.8 (...)", ...
+        let major = first_line
+            .split("clang version ")
+            .nth(1)
+            .and_then(|v| v.split('.').next())
+            .unwrap_or("");
+        if major != CLANG_MAJOR_VERSION {
+            panic!("Clang {CLANG_MAJOR_VERSION}.x is pinned, found: {first_line}");
         }
         let fw = root.join("sdk-nrfxlib/nrf_wifi/bin/zephyr/default/nrf70.bin");
         let lic = root.join("sdk-nrfxlib/LICENSE");
