@@ -157,7 +157,7 @@ impl<D: SpiDevice<u8>, C: BoardControl> SpiTransport<D, C> {
                 .transaction(&mut [Operation::Write(&header), Operation::Read(dst)])
                 .map_err(|_| ());
         }
-        for (i, word) in dst.chunks_exact_mut(4).enumerate() {
+        for (i, word) in dst.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             // Unlike the two paths above, the latency>0 windows are addressed
             // without the 0x800000 bit; this is a real hardware distinction.
             let header = Self::header(0x0b, address + i as u32 * 4);
@@ -223,8 +223,8 @@ impl<D: SpiDevice<u8> + Send, C: BoardControl + Send> Bus for SpiTransport<D, C>
         self.control.host_irq_active()
     }
     #[cfg(feature = "defmt")]
-    fn log(&mut self, level: u8, message: *const core::ffi::c_char) {
-        // The facade's contract is that `message` is a nul-terminated static.
+    unsafe fn log(&mut self, level: u8, message: *const core::ffi::c_char) {
+        // SAFETY: upheld by the caller as part of `Bus::log`'s contract.
         let message = unsafe { c_message(message) };
         match level {
             0 => defmt::debug!("nrf70: {=str}", message),
@@ -234,8 +234,8 @@ impl<D: SpiDevice<u8> + Send, C: BoardControl + Send> Bus for SpiTransport<D, C>
         }
     }
     #[cfg(feature = "defmt")]
-    fn fatal(&mut self, reason: i32, message: *const core::ffi::c_char) {
-        // The facade's contract is that `message` is a nul-terminated static.
+    unsafe fn fatal(&mut self, reason: i32, message: *const core::ffi::c_char) {
+        // SAFETY: upheld by the caller as part of `Bus::fatal`'s contract.
         let message = unsafe { c_message(message) };
         defmt::error!("nrf70: fatal {=i32}: {=str}", reason, message);
     }

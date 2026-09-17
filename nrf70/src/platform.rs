@@ -28,8 +28,18 @@ pub trait Bus {
     /// implementation as fatal-quality and substitutes a constant 0.
     fn random_u8(&mut self) -> u8;
     fn host_irq_active(&self) -> bool;
-    fn log(&mut self, _level: u8, _message: *const c_char) {}
-    fn fatal(&mut self, _reason: i32, _message: *const c_char) {}
+    /// Records a message supplied by the C facade.
+    ///
+    /// # Safety
+    /// `message` must be null or point to a valid, nul-terminated string for
+    /// the duration of this call.
+    unsafe fn log(&mut self, _level: u8, _message: *const c_char) {}
+    /// Records a fatal error supplied by the C facade.
+    ///
+    /// # Safety
+    /// `message` must be null or point to a valid, nul-terminated string for
+    /// the duration of this call.
+    unsafe fn fatal(&mut self, _reason: i32, _message: *const c_char) {}
 }
 
 /// Maps a `Bus` result onto the C ABI's 0/-1 convention.
@@ -133,10 +143,10 @@ unsafe impl<B: Bus + Send, const N: usize> nrf70_sys::Platform for Platform<B, N
     fn host_irq_active(&self) -> bool {
         self.bus().host_irq_active()
     }
-    fn log(&self, l: u8, m: *const c_char) {
-        self.bus().log(l, m)
+    unsafe fn log(&self, l: u8, m: *const c_char) {
+        unsafe { self.bus().log(l, m) }
     }
-    fn fatal(&self, r: i32, m: *const c_char) {
-        self.bus().fatal(r, m)
+    unsafe fn fatal(&self, r: i32, m: *const c_char) {
+        unsafe { self.bus().fatal(r, m) }
     }
 }

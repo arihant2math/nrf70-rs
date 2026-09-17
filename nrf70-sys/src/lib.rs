@@ -305,8 +305,14 @@ pub unsafe trait Platform: Sync {
     fn now_us(&self) -> u32;
     fn random_u8(&self) -> u8;
     fn host_irq_active(&self) -> bool;
-    fn log(&self, _level: u8, _message: *const c_char) {}
-    fn fatal(&self, _reason: i32, _message: *const c_char) {}
+    /// # Safety
+    /// `message` must be null or point to a valid, nul-terminated string for
+    /// the duration of this call.
+    unsafe fn log(&self, _level: u8, _message: *const c_char) {}
+    /// # Safety
+    /// `message` must be null or point to a valid, nul-terminated string for
+    /// the duration of this call.
+    unsafe fn fatal(&self, _reason: i32, _message: *const c_char) {}
 }
 struct Slot(UnsafeCell<Option<&'static dyn Platform>>);
 unsafe impl Sync for Slot {}
@@ -366,10 +372,12 @@ unsafe extern "C" fn irq(_: *mut c_void) -> u8 {
     platform().host_irq_active() as u8
 }
 unsafe extern "C" fn log(_: *mut c_void, l: u8, m: *const c_char) {
-    platform().log(l, m)
+    // SAFETY: the facade owns `m` and guarantees a valid C string for this call.
+    unsafe { platform().log(l, m) }
 }
 unsafe extern "C" fn fatal(_: *mut c_void, r: i32, m: *const c_char) {
-    platform().fatal(r, m)
+    // SAFETY: the facade owns `m` and guarantees a valid C string for this call.
+    unsafe { platform().fatal(r, m) }
 }
 struct Ops(raw::nrf70_facade_platform_ops);
 unsafe impl Sync for Ops {}

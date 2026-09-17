@@ -47,7 +47,7 @@ unsafe impl nrf70_sys::Platform for Mock {
     fn host_irq_active(&self) -> bool {
         false
     }
-    fn log(&self, _: u8, _: *const c_char) {}
+    unsafe fn log(&self, _: u8, _: *const c_char) {}
 }
 static MOCK: Mock = Mock;
 
