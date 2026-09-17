@@ -1293,6 +1293,9 @@ mod tests {
         assert!(!credential_candidate(Security::Other, &psk));
         assert!(credential_candidate(Security::Open, &Credential::Open));
         assert!(!credential_candidate(Security::Wpa3Sae, &Credential::Open));
-        assert!(!credential_candidate(Security::Wpa2Personal, &Credential::Open));
+        assert!(!credential_candidate(
+            Security::Wpa2Personal,
+            &Credential::Open
+        ));
     }
 }

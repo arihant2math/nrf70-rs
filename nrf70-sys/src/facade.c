@@ -244,13 +244,8 @@ static void write_mem(void*p,unsigned long a,const void*s,size_t n){
 static int ps_sleep(void*p){(void)p;return platform?platform->sleep(platform->context):-1;}static int ps_wake(void*p){(void)p;return platform?platform->wake(platform->context):-1;}static int ps_status(void*p){(void)p;return platform?platform->power_status(platform->context):-1;}
 static void os_assert(int t,int v,enum nrf_wifi_assert_op_type op,char*m){int ok=0;switch(op){case NRF_WIFI_ASSERT_EQUAL_TO:ok=t==v;break;case NRF_WIFI_ASSERT_NOT_EQUAL_TO:ok=t!=v;break;case NRF_WIFI_ASSERT_LESS_THAN:ok=t<v;break;case NRF_WIFI_ASSERT_LESS_THAN_EQUAL_TO:ok=t<=v;break;case NRF_WIFI_ASSERT_GREATER_THAN:ok=t>v;break;case NRF_WIFI_ASSERT_GREATER_THAN_EQUAL_TO:ok=t>=v;break;default:ok=0;}if(!ok)fatal(NRF70_FACADE_FATAL,m?m:"nrf_wifi assert");}
 
-/* Control lists and data-memory metadata use the same arena-backed helpers
- * as ordinary lists and allocations. The vendor OSAL calls these separate
- * hooks unconditionally; leaving them unset branches to NULL at startup. */
 const struct nrf_wifi_osal_ops nrf_wifi_os_bm_ops = {
  .mem_alloc=mem_alloc,.mem_zalloc=mem_zalloc,.mem_free=mem_free,.mem_cpy=nrf70_os_memcpy,.mem_set=nrf70_os_memset,.mem_cmp=nrf70_os_memcmp,
- .data_mem_zalloc=mem_zalloc,.data_mem_free=mem_free,
- .ctrl_llist_alloc=list_alloc,.ctrl_llist_free=list_free,.ctrl_llist_node_alloc=node_alloc,.ctrl_llist_node_free=node_free,
  .qspi_read_reg32=read32,.qspi_write_reg32=write32,.qspi_cpy_from=read_mem,.qspi_cpy_to=write_mem,
  .spinlock_alloc=lock_alloc,.spinlock_free=lock_free,.spinlock_init=lock_init,.spinlock_take=lock_take,.spinlock_rel=lock_rel,.spinlock_irq_take=lock_irq_take,.spinlock_irq_rel=lock_irq_rel,
  .log_dbg=log_drop,.log_info=log_drop,.log_err=log_fmt_err,
