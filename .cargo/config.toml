@@ -1,10 +1,7 @@
 [build]
 target = "thumbv8m.main-none-eabihf"
 
-[env]
-# nrf70-sys's build.rs invokes plain `clang` for the embedded target. Apple
-# clang emits the ELF objects fine, but its ld64/ar/ranlib choke on them. Put
-# Homebrew LLVM 21 (brew install llvm@21) first so clang, lld, and
-# llvm-ar/ranlib all speak GNU/ELF — pinned to the major build.rs expects.
-# Kept in sync with mcu/.cargo/config.toml, which builds these same crates.
-PATH = { value = "/opt/homebrew/opt/llvm@21/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/anaren/.cargo/bin:/Users/anaren/Documents/arm-gnu-toolchain/bin", force = true }
+# Like mcu/.cargo/config.toml, inherit PATH rather than forcing a developer's
+# macOS paths (which hides Cargo/Rust on Linux CI). For embedded builds on
+# macOS, export PATH="/opt/homebrew/opt/llvm@21/bin:$PATH" before invoking Cargo.
+# nrf70-sys pins Clang 21.x; CI puts that version on PATH explicitly.
