@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
-/* WPA2-Personal supplicant module: owns the hostap wpa_sm session, the os_*
- * and libc shims the hostap subset needs, a 4-slot mini-eloop, and the sliced
- * PBKDF2-SHA1 passphrase derivation. Compiled inside the hostap cc build with
- * the same defines; facade.c stays decoupled through supplicant.h. */
+/* WPA2-Personal supplicant: hostap wpa_sm session, os_ and libc shims, a
+ * mini-eloop, and sliced PBKDF2. Compiled inside the hostap cc build with the
+ * same defines. */
 #include "includes.h"
 #include "common.h"
 #include "common/defs.h"
@@ -15,11 +14,8 @@
 
 int nrf70_supp_errno; /* referenced by the shim <errno.h>; nothing reads it */
 
-/* ---- libc interposer implementations beyond the facade.c set.
- * The facade archive provides nrf70_os_{malloc,calloc,free,memcpy,memset,
- * memcmp,strlen,strcmp,printf,snprintf}. The symbols below are referenced by
- * utils/common.c, common/ieee802_11_common.c, and utils/wpabuf.c helper paths
- * that are unreachable in the WPA2-PSK runtime subset but must still link. */
+/* libc interposers beyond the set facade.c provides. Referenced only by hostap
+ * helper paths that are unreachable in the WPA2-PSK subset but must link. */
 void *nrf70_os_memcpy(void *d, const void *s, size_t n);
 void *nrf70_os_memset(void *d, int v, size_t n);
 void nrf70_os_free(void *p);
@@ -33,9 +29,8 @@ void *nrf70_os_memmove(void *d, const void *s, size_t n) {
     else { dd += n; ss += n; while (n--) *--dd = *--ss; }
     return d;
 }
-/* The block size of the original allocation is unknown here, so growing is not
- * supported. Only unreachable helper paths (wpabuf_resize, freq-range lists)
- * call realloc; they treat NULL as out-of-memory and recover. */
+/* Growing is unsupported (original block size unknown). Only unreachable
+ * helper paths call realloc, and they treat NULL as out-of-memory. */
 void *nrf70_os_realloc(void *p, size_t n) { (void)p; (void)n; return NULL; }
 char *nrf70_os_strdup(const char *s) {
     size_t n = nrf70_os_strlen(s) + 1u;
@@ -103,8 +98,7 @@ void nrf70_os_qsort(void *base, size_t nmemb, size_t size,
 }
 void nrf70_os_abort(void) { for (;;) { } } /* wpabuf overflow guard; unreachable */
 
-/* ---- os_* shims required by the hostap subset (os.h maps the rest to the
- * interposed libc set). */
+/* os_* shims; os.h maps the rest to the interposed libc set. */
 void *os_zalloc(size_t size) {
     void *p = nrf70_os_malloc(size);
     if (p) nrf70_os_memset(p, 0, size);
@@ -138,8 +132,8 @@ int os_get_reltime(struct os_reltime *t) {
     return 0;
 }
 
-/* ---- mini-eloop: only the two entry points the subset references. With
- * wpa_ptk_rekey unset these slots stay empty; sized for safety, not load. */
+/* Mini-eloop: only the two entry points the subset references. With
+ * wpa_ptk_rekey unset these slots stay empty. */
 #define SUPP_ELOOP_SLOTS 4u
 struct supp_timeout {
     uint8_t used;
@@ -190,9 +184,8 @@ uint32_t nrf70_supp_eloop_poll(uint32_t now_us) {
     return ran;
 }
 
-/* ---- sliced PBKDF2-SHA1 (RFC 2898): 4096 iterations, two 20-byte blocks for
- * the 32-byte PMK. hostap's one-shot pbkdf2_sha1 would block for tens of
- * milliseconds; this advances a bounded iteration count per step. */
+/* Sliced PBKDF2-SHA1 (RFC 2898): 4096 iterations, two 20-byte blocks for the
+ * 32-byte PMK. hostap's one-shot pbkdf2_sha1 would block for tens of ms. */
 struct pbkdf2_state {
     uint8_t active, block, pass_len, ssid_len;
     uint16_t iter;
@@ -254,7 +247,6 @@ int32_t nrf70_supp_pbkdf2_step(uint8_t pmk_out[NRF70_SUPP_PMK_LEN]) {
     return 0;
 }
 
-/* ---- wpa_sm session */
 static struct wpa_sm *supp_sm;
 static enum wpa_states supp_state;
 static uint8_t supp_bssid[6], supp_own_addr[6];

@@ -32,10 +32,9 @@ pub const CREDENTIAL_PSK: u8 = 2;
 pub const MFP_DISABLED: u8 = 0;
 pub const MFP_OPTIONAL: u8 = 1;
 pub const MFP_REQUIRED: u8 = 2;
-/// Each entry pairs a compile-time layout assertion against the bindgen struct
-/// with the matching run-time probe of the C side's own `sizeof`/`alignof`.
-/// `align` adds the compile-time alignment assertion; `probe` additionally
-/// checks alignment at run time (only `scan_request` has such a C probe).
+/// Per entry: compile-time size (and optional `align`) assertion on the bindgen
+/// struct, plus a run-time check against the C side's own `sizeof` (and
+/// `alignof` with `probe`).
 macro_rules! abi_checks {
     ($($ty:ident, $size:expr, $sizeof:ident $(, align $align:expr)? $(, probe $alignof:ident)?;)*) => {
         $(
@@ -126,9 +125,8 @@ pub struct ScanResult {
     pub security: Security,
     pub mfp: u8,
 }
-/// Mirror of `struct nrf70_facade_connect_request`. Carries credential bytes,
-/// so it deliberately derives neither `Debug` nor `Copy`/`Clone`; the caller
-/// zeroizes its copy after `connect_start` returns.
+/// Carries credential bytes, so no `Debug`/`Copy`/`Clone`; the caller zeroizes
+/// its copy after `connect_start` returns.
 pub struct ConnectTarget {
     pub ssid: [u8; MAX_SSID_LEN],
     pub ssid_len: u8,
@@ -220,9 +218,7 @@ pub struct RxMeta {
     pub length: u16,
     pub rssi_dbm: i8,
 }
-/// The safe mirror of `struct nrf70_facade_stats`: every counter is a `u32`
-/// and keeps the C field's name, so one list drives both the struct and the
-/// conversion in [`stats`].
+/// Field names must match `struct nrf70_facade_stats`; all counters are `u32`.
 macro_rules! stats_fields {
     ($($field:ident,)*) => {
         #[derive(Clone, Copy, Debug, Default)]
@@ -476,10 +472,8 @@ fn raw_security(s: Security) -> u8 {
         Security::Other => raw::nrf70_facade_security_NRF70_FACADE_SECURITY_OTHER,
     }) as u8
 }
-/// Starts the C-side connect state machine (PMK derivation, connect scan,
-/// auth, assoc, EAPOL handshake). The local raw copy of the request, which
-/// contains the credential, is volatile-wiped before this returns; the caller
-/// zeroizes its own [`ConnectTarget`] copy.
+/// The local raw copy of the credential is wiped before returning; the caller
+/// zeroizes its own [`ConnectTarget`].
 /// # Safety Call only from the serialized runner.
 pub unsafe fn connect_start(t: &ConnectTarget) -> Result<(), Status> {
     let mut r = raw::nrf70_facade_connect_request {
@@ -497,8 +491,7 @@ pub unsafe fn connect_start(t: &ConnectTarget) -> Result<(), Status> {
     wipe(&mut r);
     result(code)
 }
-/// Cancels a pending or completed connect: tears down supplicant state,
-/// zeroizes secrets, and deauthenticates if the radio is associated.
+/// Also valid after a completed connect; deauthenticates if associated.
 /// # Safety Call only from the serialized runner.
 pub unsafe fn connect_abort(reason: u16) -> Result<(), Status> {
     result(unsafe { raw::nrf70_facade_connect_abort(reason) })

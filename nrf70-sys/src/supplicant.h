@@ -1,10 +1,10 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 /* Internal contract between facade.c and supplicant.c. NOT part of the Rust ABI.
  * facade.c never includes hostap headers; supplicant.c never includes nrf_wifi
- * headers. Everything crosses this boundary as plain C types. All functions run
- * on the serialized Wi-Fi context: the supp_* entry points are called only from
- * nrf70_facade_process() top level, and the nrf70_supp_host_* hooks are called
- * only from inside those supp_* calls, so they may re-enter FMAC directly. */
+ * headers. All functions run on the serialized Wi-Fi context: the supp_* entry
+ * points are called only from nrf70_facade_process() top level, and the
+ * nrf70_supp_host_* hooks only from inside those calls, so they may re-enter
+ * FMAC directly. */
 #ifndef NRF70_SUPPLICANT_H
 #define NRF70_SUPPLICANT_H
 
@@ -15,7 +15,7 @@
 #define NRF70_SUPP_ASSOC_IE_MAX 64u
 #define NRF70_SUPP_PBKDF2_SLICE_ITERS 256u
 
-/* --- implemented in supplicant.c, called by facade.c --- */
+/* Implemented in supplicant.c, called by facade.c. */
 
 /* Sliced PBKDF2-SHA1 (4096 iterations, 2 blocks). start copies and owns a
  * zeroized-on-completion staging copy of the passphrase. */
@@ -26,13 +26,11 @@ int32_t nrf70_supp_pbkdf2_start(const uint8_t *passphrase, uint8_t passphrase_le
  * negative on misuse. */
 int32_t nrf70_supp_pbkdf2_step(uint8_t pmk_out[NRF70_SUPP_PMK_LEN]);
 
-/* Creates the wpa_sm session (WPA2-PSK/CCMP, RSN only), installs the PMK and
- * the AP RSN IE (and RSNXE when present), and emits the association RSN IE to
- * assoc_ie_out (capacity NRF70_SUPP_ASSOC_IE_MAX, *assoc_ie_len in/out).
- * akm_sha256!=0 selects the PSK-SHA256 AKM (00-0F-AC:6) instead of plain PSK;
- * mfp>0 additionally enables the BIP-CMAC-128 management group cipher so the
- * IGTK from msg3/group rekeys is installed. The caller zeroizes its pmk copy
- * after this returns. */
+/* Creates the wpa_sm session (WPA2-PSK/CCMP, RSN only) and writes the
+ * association RSN IE to assoc_ie_out (capacity NRF70_SUPP_ASSOC_IE_MAX,
+ * *assoc_ie_len in/out). akm_sha256!=0 selects PSK-SHA256 (00-0F-AC:6);
+ * mfp>0 enables BIP-CMAC-128 so the IGTK is installed. The caller zeroizes
+ * its pmk copy after this returns. */
 int32_t nrf70_supp_start(const uint8_t own_addr[6], const uint8_t bssid[6],
                          const uint8_t pmk[NRF70_SUPP_PMK_LEN], uint8_t mfp,
                          uint8_t akm_sha256,
@@ -51,7 +49,7 @@ void nrf70_supp_stop(void);
 void nrf70_supp_clear_secrets(void);
 uint8_t nrf70_supp_active(void);
 
-/* --- implemented in facade.c, called by supplicant.c --- */
+/* Implemented in facade.c, called by supplicant.c. */
 
 uint32_t nrf70_supp_host_now_us(void);
 uint8_t nrf70_supp_host_random_u8(void);
@@ -64,9 +62,8 @@ int32_t nrf70_supp_host_add_key(uint8_t pairwise, const uint8_t peer[6],
                                 const uint8_t *key, uint16_t key_len,
                                 const uint8_t *seq, uint16_t seq_len,
                                 uint8_t is_mgmt);
-/* Builds dst/src/proto Ethernet header around buf and transmits through the
- * normal FMAC data path (this pin has no control-port TX command). Does not
- * require the data link to be up. */
+/* Wraps buf in an Ethernet header and sends it through the normal FMAC data
+ * path. Does not require the data link to be up. */
 int32_t nrf70_supp_host_ether_send(const uint8_t dst[6], uint16_t proto,
                                    const uint8_t *buf, size_t len);
 /* Handshake failure: emits HANDSHAKE_FAILED, deauthenticates the radio, and

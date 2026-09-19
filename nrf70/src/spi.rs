@@ -159,7 +159,7 @@ impl<D: SpiDevice<u8>, C: BoardControl> SpiTransport<D, C> {
         }
         for (i, word) in dst.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             // Unlike the two paths above, the latency>0 windows are addressed
-            // without the 0x800000 bit; this is a real hardware distinction.
+            // without the 0x800000 bit.
             let header = Self::header(0x0b, address + i as u32 * 4);
             let mut scratch = [0u8; 12];
             let n = latency as usize * 4 + 4;

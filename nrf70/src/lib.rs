@@ -104,7 +104,6 @@ pub const fn channel_to_5ghz_frequency(channel: u8) -> Option<u16> {
     }
 }
 
-/// Phase 4 will widen this; today the driver is 5 GHz only by policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BandPolicy {
     FiveGhzOnly,
@@ -144,8 +143,7 @@ impl Drop for PassphraseBuf {
         self.len = 0;
     }
 }
-/// Connection credential. Secret bytes are zeroized when the value is dropped
-/// and are never logged; `Debug` prints a redacted placeholder.
+/// Secret bytes are zeroized on drop; `Debug` is redacted.
 pub enum Credential {
     Open,
     Passphrase(PassphraseBuf),
@@ -306,12 +304,9 @@ enum Response {
 
 pub struct Resources {
     commands: Channel<CriticalSectionRawMutex, Command, 2>,
-    /// Pending connect credentials, handed to the runner out-of-band so no
-    /// secret bytes are ever copied through (or linger in) the command
-    /// channel's queue storage. The runner zeroizes the contents in place
-    /// before clearing the slot. Residual risk: if the runner is never
-    /// scheduled after `Wifi::connect` stashed a request, the credentials
-    /// stay in this slot until it is next overwritten or scrubbed.
+    /// Pending connect credentials, kept out of the command channel's queue
+    /// storage. The runner zeroizes them in place before clearing the slot; if
+    /// it never runs, they stay here until overwritten or scrubbed.
     connect_stash: BlockingMutex<CriticalSectionRawMutex, RefCell<Option<ConnectParams>>>,
     responses: Channel<CriticalSectionRawMutex, Response, 16>,
     events: Channel<CriticalSectionRawMutex, LinkEvent, 8>,
@@ -503,8 +498,7 @@ impl Wifi<'_> {
             _ => Err(Error::Fatal),
         }
     }
-    /// Runs a command that neither cancels on drop nor streams results: take
-    /// the guard, send the command built from its id, await the single `Done`.
+    /// For commands that neither cancel on drop nor stream results.
     async fn simple(&self, make: impl FnOnce(u32) -> Command) -> Result<(), Error> {
         let g = self.guard(false)?;
         self.r.commands.send(make(g.id)).await;
@@ -545,9 +539,7 @@ impl Wifi<'_> {
             }
         }
     }
-    /// Scans 5 GHz for the request's SSID and picks the best-RSSI AP whose
-    /// security fits the credential. Any given `bssid`/`frequency_mhz` only
-    /// filters the candidates.
+    /// Picks the best-RSSI AP whose security fits the credential.
     async fn select_ap(&self, request: &ConnectRequest) -> Result<([u8; 6], u16, Security), Error> {
         let mut scan = ScanRequest::five_ghz(request.country);
         scan.ssid_filter = request.ssid.clone();
@@ -585,19 +577,12 @@ impl Wifi<'_> {
                 Error::NotFound
             });
         };
-        // The connect target frequency always comes from the
-        // picked AP's own channel; a requested frequency only
-        // filters the candidates above.
         let frequency_mhz = channel_to_5ghz_frequency(ap.channel).ok_or(Error::InvalidRequest)?;
         Ok((ap.bssid, frequency_mhz, ap.security))
     }
-    /// Connects to a network. Open networks complete on link-up; secured
-    /// networks (WPA2-Personal CCMP) complete once the supplicant finishes the
-    /// 4-way handshake and authorizes the controlled port, so a returned
-    /// `Ok(())` always means the link is usable. When `bssid`/`frequency_mhz`
-    /// are not both given, a 5 GHz SSID-filtered scan picks the best-RSSI
-    /// compatible AP first. Credential bytes are zeroized on every path and
-    /// never logged.
+    /// `Ok(())` means the link is usable: open networks complete on link-up,
+    /// secured ones (WPA2-Personal CCMP) once the 4-way handshake authorizes
+    /// the controlled port. Credential bytes are zeroized on every path.
     pub async fn connect(&self, request: ConnectRequest) -> Result<(), Error> {
         if request.ssid.is_empty() {
             return Err(Error::InvalidRequest);
@@ -657,8 +642,6 @@ impl Wifi<'_> {
         });
         credential.zeroize();
         let mut g = self.guard(true)?;
-        // Credentials go through the stash, never the command channel, so no
-        // bitwise copy of the secret is left in the channel's queue storage.
         // Overwriting a stale entry drops it in place, which zeroizes it.
         self.r
             .connect_stash
@@ -758,8 +741,7 @@ impl<B: Bus + Send + 'static, const N: usize> Runner<'_, B, N> {
         self.session_established = false;
         self.pending_link = None;
     }
-    /// Zeroizes and clears any pending connect credentials in place; nothing
-    /// is moved out of the stash slot, so no bitwise residue is left behind.
+    /// Zeroizes in place; moving the value out would leave a bitwise copy.
     fn scrub_connect_stash(&self) {
         self.r.connect_stash.lock(|stash| {
             let mut slot = stash.borrow_mut();
@@ -837,9 +819,8 @@ impl<B: Bus + Send + 'static, const N: usize> Runner<'_, B, N> {
                 result: Err(Error::Busy),
             })
         } else {
-            // Start from the stash in place: the credential bytes are
-            // never moved out of the static slot, and are zeroized
-            // there before the slot is cleared.
+            // Use the stash in place so the credential bytes are never moved
+            // out of the static slot.
             let outcome = self.r.connect_stash.lock(|stash| {
                 let mut slot = stash.borrow_mut();
                 let outcome = match slot.as_mut() {
@@ -1057,12 +1038,9 @@ impl<B: Bus + Send + 'static, const N: usize> Runner<'_, B, N> {
     }
     fn on_link(&mut self, up: bool, frequency_mhz: u16, rssi_dbm: i8) {
         if up && self.connect_id.is_none() && !self.session_established {
-            // Stale carrier-up: no connect is pending and no
-            // session was ever established (e.g. assoc completed
-            // just before an abort's deauth reached the firmware).
-            // Raising the link here would open the data path with
-            // no keys installed, so force the firmware link back
-            // down instead and never surface the event.
+            // Stale carrier-up (e.g. assoc completed just before an abort's
+            // deauth reached the firmware). Raising the link would open the
+            // data path with no keys installed, so force it back down.
             self.r.stale.fetch_add(1, Ordering::Relaxed);
             let _ = unsafe { nrf70_sys::disconnect(3) };
         } else if up && self.secured && !self.port_authorized {
@@ -1176,9 +1154,8 @@ impl<B: Bus + Send + 'static, const N: usize> Runner<'_, B, N> {
                     if !(14..=ETHERNET_FRAME_SIZE).contains(&n) {
                         continue;
                     }
-                    // EAPOL frames belong to the C-side supplicant; the facade
-                    // never queues them here, but skip any defensively so key
-                    // material can never reach embassy-net.
+                    // EAPOL belongs to the C-side supplicant; key material
+                    // must never reach embassy-net.
                     if frame[12..14] == EAPOL_ETHERTYPE {
                         continue;
                     }
@@ -1191,9 +1168,7 @@ impl<B: Bus + Send + 'static, const N: usize> Runner<'_, B, N> {
         }
     }
     fn pump_tx(&mut self) {
-        // For secured sessions the net link only rises on PORT_AUTHORIZED, but
-        // keep the port check as a second gate against ever transmitting data
-        // frames during the handshake.
+        // Second gate against transmitting data frames during the handshake.
         if !self.linked || (self.secured && !self.port_authorized) {
             return;
         }

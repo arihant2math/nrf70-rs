@@ -22,8 +22,7 @@
 /* Connect state machine. Steps advance only in nrf70_facade_process; FMAC
  * event callbacks merely set flags. Open networks skip DERIVE/SCAN/HANDSHAKE.
  * EAPOL TX/RX use the normal FMAC data path as 0x888E Ethernet frames: this
- * nrf_wifi revision has no control-port TX command (deviation from the plan
- * text, see README). */
+ * nrf_wifi revision has no control-port TX command. */
 enum conn_state {
     CONN_IDLE = 0,
     CONN_DERIVE,      /* sliced PBKDF2 passphrase -> PMK */
@@ -85,8 +84,7 @@ void *nrf70_os_memset(void *d, int v, size_t n);
 static void conn_teardown_now(void);
 
 static uint32_t now_us(void) { return platform && platform->now_us ? platform->now_us(platform->context) : 0; }
-/* Zeroization that the optimizer must not elide; used for every buffer that
- * ever held credential, PMK, or key material. Key material is never logged. */
+/* Zeroization the optimizer must not elide; for credential/PMK/key buffers. */
 static void secure_zero(void *p, size_t n) { volatile uint8_t *d = p; while (n--) *d++ = 0; }
 static void reset_runtime(void) { nrf70_os_memset(tasklets,0,sizeof(tasklets)); nrf70_os_memset(timers,0,sizeof(timers)); nrf70_os_memset(locks,0,sizeof(locks)); event_read=event_write=event_count=0; rx_read=rx_write=rx_count=0; irq_pending=0; faulted=0; irq_data=0; irq_callback=0; scan_active=scan_suppress=0; linked=0; callbacks_enabled=0; tx_call_active=scan_fetch_pending=scan_command_active=0; associated_frequency=0; scan_result_count=scan_max_results=0; current_rssi=0; fmac_priv=0; fmac_dev=0; sta_vif_idx=MAX_NUM_VIFS; secure_zero(&conn,sizeof(conn)); secure_zero(eapol_slots,sizeof(eapol_slots)); eapol_read=eapol_write=eapol_count=0; }
 static void account_call(uint32_t start) { uint32_t d = now_us() - start; if (d > counters.max_c_call_us) counters.max_c_call_us = d; }
@@ -128,9 +126,8 @@ int nrf70_os_snprintf(char *dst,size_t n,const char *fmt,...){
 
 static void *mem_alloc(size_t n){return nrf70_os_malloc(n);} static void *mem_zalloc(size_t n){return nrf70_os_calloc(1,n);} static void mem_free(void*p){nrf70_os_free(p);}
 static int log_drop(const char *f,va_list a){(void)f;(void)a;return 0;}
-/* Minimal printf-style formatter for the nrf_wifi diagnostic logs. Covers the
- * specifiers those logs actually use (%s, %c, %d, %u, %x/%X, %p, with z/l
- * modifiers); anything else prints as '?'. Bounded output, no libc. */
+/* Formatter for nrf_wifi logs: %s %c %d %u %x/%X %p with z/l modifiers;
+ * anything else prints as '?'. Output is truncated to the buffer. */
 static void log_fmt_put(char*buf,size_t cap,size_t*w,char c){if(*w+1<cap)buf[*w]=c;(*w)++;}
 static void log_fmt_num(char*buf,size_t cap,size_t*w,unsigned long v,unsigned base,int upper){
     char tmp[2*sizeof(v)+3];unsigned i=0;
@@ -201,10 +198,9 @@ static enum nrf_wifi_status irq_reg(void*d,void*c,int(*fn)(void*)){(void)d;irq_d
 static void host_map(void*d,struct nrf_wifi_osal_host_map*m){(void)d;m->addr=0;m->size=0xFFFFFFFFu;}
 static unsigned int read32(void*p,unsigned long a){(void)p;uint32_t v=0,s=now_us();if(!platform||platform->read_reg32(platform->context,(uint32_t)a,&v)){v=0;counters.spi_errors++;fatal(NRF70_FACADE_IO,"SPI register read");}uint32_t d=now_us()-s;if(d>counters.max_spi_transfer_us)counters.max_spi_transfer_us=d;return v;}
 static void write32(void*p,unsigned long a,unsigned int v){(void)p;uint32_t s=now_us();if(!platform||platform->write_reg32(platform->context,(uint32_t)a,v)){counters.spi_errors++;fatal(NRF70_FACADE_IO,"SPI register write");}uint32_t d=now_us()-s;if(d>counters.max_spi_transfer_us)counters.max_spi_transfer_us=d;}
-/* The RPU bus moves whole 32-bit words, but the driver's commands and events
- * have arbitrary byte sizes (e.g. sizeof(struct nrf_wifi_cmd_sys_init) ==
- * 341), so transfers with an unaligned buffer or length bounce through a
- * zero-padded aligned copy, as Nordic's Zephyr shim does. The RPU-side
+/* The RPU bus moves whole 32-bit words, but driver commands and events have
+ * arbitrary byte sizes, so an unaligned buffer or length bounces through a
+ * zero-padded aligned copy (as Nordic's Zephyr shim does). The RPU-side
  * address must stay word-aligned. Bounce buffers may carry key material and
  * are zeroed before release. */
 static void read_mem(void*p,void*d,unsigned long a,size_t n){
@@ -333,8 +329,7 @@ static void connect_scan_res_cb(void *vif,struct nrf_wifi_umac_event_new_scan_re
     if(r&&len>=offsetof(struct nrf_wifi_umac_event_new_scan_results,ies))
         log_diag("connect scan: len=%u flags=%x ies=%u beacon=%u more=%u bssid=%02x:%02x:%02x:%02x:%02x:%02x",len,r->valid_fields,r->ies_len,r->beacon_ies_len,(unsigned)more,r->mac_addr[0],r->mac_addr[1],r->mac_addr[2],r->mac_addr[3],r->mac_addr[4],r->mac_addr[5]);
     /* The RPU-declared ies_len/beacon_ies_len must fit inside the delivered
-     * event (the HAL allocates exactly the declared message length); a
-     * malformed event is ignored rather than parsed out of bounds. */
+     * event (the HAL allocates exactly the declared message length). */
     if(r&&len>=(unsigned int)offsetof(struct nrf_wifi_umac_event_new_scan_results,ies)&&
        (uint64_t)r->ies_len+(uint64_t)r->beacon_ies_len<=
        (uint64_t)(len-offsetof(struct nrf_wifi_umac_event_new_scan_results,ies))){
@@ -444,18 +439,14 @@ int32_t nrf70_facade_init(const struct nrf70_facade_platform_ops*ops,const uint8
 int32_t nrf70_facade_deinit(void){if(!initialized)return NRF70_FACADE_NOT_INITIALIZED;callbacks_enabled=0;scan_active=0;conn_teardown_now();uint32_t s=now_us();fmac_stop();account_call(s);initialized=0;reset_runtime();platform=0;return 0;}
 int32_t nrf70_facade_reset(const uint8_t mac[6],const uint8_t country[2]){if(!initialized)return NRF70_FACADE_NOT_INITIALIZED;if(!mac||!country)return NRF70_FACADE_INVALID;callbacks_enabled=0;scan_active=0;conn_teardown_now();uint32_t s=now_us();fmac_stop();account_call(s);reset_runtime();generation++;counters.generation=generation;counters.resets++;s=now_us();int r=fmac_start(mac,country);account_call(s);if(r||faulted){initialized=0;return NRF70_FACADE_FATAL;}counters.firmware_restarts++;push_simple(NRF70_FACADE_EVENT_FIRMWARE_RESTART,0);return 0;}
 int32_t nrf70_facade_set_country(const uint8_t c[2]){if(!initialized)return NRF70_FACADE_NOT_INITIALIZED;if(!c)return NRF70_FACADE_INVALID;struct nrf_wifi_fmac_reg_info reg={0};reg.alpha2[0]=c[0];reg.alpha2[1]=c[1];reg.force=true;uint32_t s=now_us();enum nrf_wifi_status r=nrf_wifi_fmac_set_reg(fmac_dev,&reg);account_call(s);return faulted?NRF70_FACADE_FATAL:(r==NRF_WIFI_STATUS_SUCCESS?0:NRF70_FACADE_IO);}
-int32_t nrf70_facade_scan_start(const struct nrf70_facade_scan_request*q){if(!initialized)return NRF70_FACADE_NOT_INITIALIZED;if(scan_active||(conn.state!=CONN_IDLE&&conn.state!=CONN_AUTHORIZED))return NRF70_FACADE_BUSY;if(!q||q->channel_count>32||q->ssid_len>=32)return NRF70_FACADE_INVALID;/* The pinned nrf_wifi_sys_fmac_scan copies sizeof(info)+sizeof(struct nrf_wifi_channel)*num_scan_channels bytes from this buffer, so reserve a zeroed nrf_wifi_channel-sized area per channel; only the leading unsigned int frequencies are meaningful on the wire (upstream semantics), the rest is zeroed facade-owned slack the FMAC over-copy may read. */struct __attribute__((packed)){struct nrf_wifi_umac_scan_info info;union{unsigned int frequency[NRF70_FACADE_MAX_CHANNELS];unsigned char reserve[sizeof(struct nrf_wifi_channel)*NRF70_FACADE_MAX_CHANNELS];}ch;}scan={0};scan.info.scan_reason=SCAN_DISPLAY;scan.info.scan_params.passive_scan=q->passive;scan.info.scan_params.bands=NRF_WIFI_SCAN_BAND_5GHZ;scan.info.scan_params.dwell_time_active=q->dwell_active_ms;scan.info.scan_params.dwell_time_passive=q->dwell_passive_ms;if(q->ssid_len){scan.info.scan_params.num_scan_ssids=1;scan.info.scan_params.scan_ssids[0].nrf_wifi_ssid_len=q->ssid_len;nrf70_os_memcpy(scan.info.scan_params.scan_ssids[0].nrf_wifi_ssid,q->ssid,q->ssid_len);}for(unsigned i=0;i<q->channel_count;i++){if(q->channels[i].band!=1)return NRF70_FACADE_INVALID;int f=nrf_wifi_utils_chan_to_freq(NRF_WIFI_BAND_5GHZ,q->channels[i].channel);if(f<0)return NRF70_FACADE_INVALID;scan.ch.frequency[i]=(unsigned int)f;}scan.info.scan_params.num_scan_channels=q->channel_count;scan_active=1;scan_suppress=0;scan_result_count=0;scan_max_results=q->max_results;counters.scans_started++;uint32_t s=now_us();scan_command_active=1;enum nrf_wifi_status r=nrf_wifi_sys_fmac_scan(fmac_dev,sta_vif_idx,&scan.info);scan_command_active=0;account_call(s);if(r!=NRF_WIFI_STATUS_SUCCESS||faulted){scan_active=0;return faulted?NRF70_FACADE_FATAL:NRF70_FACADE_IO;}return 0;}
+int32_t nrf70_facade_scan_start(const struct nrf70_facade_scan_request*q){if(!initialized)return NRF70_FACADE_NOT_INITIALIZED;if(scan_active||(conn.state!=CONN_IDLE&&conn.state!=CONN_AUTHORIZED))return NRF70_FACADE_BUSY;if(!q||q->channel_count>32||q->ssid_len>=32)return NRF70_FACADE_INVALID;/* The pinned nrf_wifi_sys_fmac_scan copies sizeof(info)+sizeof(struct nrf_wifi_channel)*num_scan_channels bytes from this buffer, so reserve a zeroed nrf_wifi_channel-sized area per channel; only the leading unsigned int frequencies are meaningful. */struct __attribute__((packed)){struct nrf_wifi_umac_scan_info info;union{unsigned int frequency[NRF70_FACADE_MAX_CHANNELS];unsigned char reserve[sizeof(struct nrf_wifi_channel)*NRF70_FACADE_MAX_CHANNELS];}ch;}scan={0};scan.info.scan_reason=SCAN_DISPLAY;scan.info.scan_params.passive_scan=q->passive;scan.info.scan_params.bands=NRF_WIFI_SCAN_BAND_5GHZ;scan.info.scan_params.dwell_time_active=q->dwell_active_ms;scan.info.scan_params.dwell_time_passive=q->dwell_passive_ms;if(q->ssid_len){scan.info.scan_params.num_scan_ssids=1;scan.info.scan_params.scan_ssids[0].nrf_wifi_ssid_len=q->ssid_len;nrf70_os_memcpy(scan.info.scan_params.scan_ssids[0].nrf_wifi_ssid,q->ssid,q->ssid_len);}for(unsigned i=0;i<q->channel_count;i++){if(q->channels[i].band!=1)return NRF70_FACADE_INVALID;int f=nrf_wifi_utils_chan_to_freq(NRF_WIFI_BAND_5GHZ,q->channels[i].channel);if(f<0)return NRF70_FACADE_INVALID;scan.ch.frequency[i]=(unsigned int)f;}scan.info.scan_params.num_scan_channels=q->channel_count;scan_active=1;scan_suppress=0;scan_result_count=0;scan_max_results=q->max_results;counters.scans_started++;uint32_t s=now_us();scan_command_active=1;enum nrf_wifi_status r=nrf_wifi_sys_fmac_scan(fmac_dev,sta_vif_idx,&scan.info);scan_command_active=0;account_call(s);if(r!=NRF_WIFI_STATUS_SUCCESS||faulted){scan_active=0;return faulted?NRF70_FACADE_FATAL:NRF70_FACADE_IO;}return 0;}
 int32_t nrf70_facade_scan_cancel(void){if(!scan_active)return NRF70_FACADE_INVALID;scan_active=0;scan_suppress=1;counters.scans_cancelled++;nrf_wifi_sys_fmac_abort_scan(fmac_dev,sta_vif_idx);struct nrf70_facade_event e={.generation=generation,.status=NRF70_FACADE_CANCELLED,.kind=NRF70_FACADE_EVENT_SCAN_COMPLETE};enqueue_event(&e,1);return 0;}
-/* --- connect state machine + supplicant host hooks ------------------------ */
 static uint8_t conn_stepping; /* sleep_ms() re-enters process(); never re-enter wpa_sm */
 static void conn_reset(void){secure_zero(&conn,sizeof(conn));secure_zero(eapol_slots,sizeof(eapol_slots));eapol_read=eapol_write=eapol_count=0;}
 static void conn_fail_ex(int32_t status,uint16_t reason){counters.handshake_failures++;struct nrf70_facade_event e={.generation=generation,.kind=NRF70_FACADE_EVENT_HANDSHAKE_FAILED,.status=status,.reason_code=reason,.frequency_mhz=associated_frequency};enqueue_event(&e,1);conn.teardown=1;}
 static void conn_fail(uint16_t reason){conn_fail_ex(NRF70_FACADE_IO,reason);}
-/* Bounded parse of the captured AP RSN IE (tag 48, body after the 2-byte
- * element header): version, group suite, pairwise list, AKM list (collecting
- * PSK / PSK-SHA256), optional RSN capabilities (MFPC/MFPR). Every read is
- * bounds-checked; returns non-zero on any malformed structure. Trailing
- * fields (PMKID list, group mgmt suite) are ignored. */
+/* Bounds-checked parse of the AP RSN IE (tag 48); returns non-zero when
+ * malformed. Trailing fields (PMKID list, group mgmt suite) are ignored. */
 struct conn_rsn_info { uint8_t has_psk, has_psk_sha256, group_ccmp, pairwise_ccmp, mfpc, mfpr; };
 static int rsn_suite_is_ccmp(const uint8_t *s){return s[0]==0&&s[1]==0x0f&&s[2]==0xac&&s[3]==4;}
 static int conn_parse_rsn(const uint8_t *ie,uint16_t ie_len,struct conn_rsn_info *out){
@@ -492,13 +483,9 @@ static int conn_parse_rsn(const uint8_t *ie,uint16_t ie_len,struct conn_rsn_info
 }
 /* Called at process() top level only (never from FMAC callback context). */
 static void conn_teardown_now(void){
-    /* A connect-reason scan may still be running in the RPU; abort it so it
-     * cannot collide with (or leak stale results into) a later attempt. The
-     * connect scan and the display scan are mutually exclusive via the BUSY
-     * checks, and the !scan_active guard keeps a display scan (and its
-     * scan_suppress bookkeeping) untouched. The stale abort/done event lands
-     * in scan_abort_cb/scan_done_cb after conn is reset to CONN_IDLE, where it
-     * is ignored. */
+    /* Abort a connect scan still running in the RPU so it cannot leak stale
+     * results into a later attempt. !scan_active leaves a display scan alone;
+     * the stale abort/done event arrives after CONN_IDLE and is ignored. */
     if((conn.state==CONN_SCAN_START||conn.state==CONN_SCAN_WAIT)&&!scan_active&&fmac_dev&&sta_vif_idx<MAX_NUM_VIFS)
         nrf_wifi_sys_fmac_abort_scan(fmac_dev,sta_vif_idx);
     nrf70_supp_stop();conn_reset();

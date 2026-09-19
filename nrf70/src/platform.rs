@@ -19,13 +19,8 @@ pub trait Bus {
     fn power_status(&mut self) -> Result<i32, Self::Error>;
     fn delay_us(&mut self, delay: u32);
     fn now_us(&self) -> u32;
-    /// Returns one byte of entropy. This is the sole entropy source for WPA2
-    /// nonce generation (the supplicant's EAPOL-Key SNonce), so it MUST be
-    /// backed by a cryptographically secure TRNG (the plan's CRACEN-backed
-    /// entropy service on the target board). A counter or weak PRNG here
-    /// makes the handshake nonces predictable and breaks the security of the
-    /// 4-way handshake. The op is mandatory: the C side treats a missing
-    /// implementation as fatal-quality and substitutes a constant 0.
+    /// Sole entropy source for the WPA2 EAPOL-Key SNonce: MUST be backed by a
+    /// cryptographically secure TRNG, or the 4-way handshake is breakable.
     fn random_u8(&mut self) -> u8;
     fn host_irq_active(&self) -> bool;
     /// Records a message supplied by the C facade.
