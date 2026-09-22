@@ -22,7 +22,8 @@
 /* Connect state machine. Steps advance only in nrf70_facade_process; FMAC
  * event callbacks merely set flags. Open networks skip DERIVE/SCAN/HANDSHAKE.
  * EAPOL TX/RX use the normal FMAC data path as 0x888E Ethernet frames: this
- * nrf_wifi revision has no control-port TX command. */
+ * nrf_wifi revision has no control-port TX command (deviation from the plan
+ * text, see README). */
 enum conn_state {
     CONN_IDLE = 0,
     CONN_DERIVE,      /* sliced PBKDF2 passphrase -> PMK */
@@ -65,7 +66,9 @@ static struct nrf70_facade_event events[EVENT_SLOTS];
 static struct rx_slot rx_slots[RX_SLOTS];
 static uint8_t event_read, event_write, event_count, rx_read, rx_write, rx_count;
 static uint8_t initialized, scan_active, scan_suppress, irq_pending, faulted;
-static uint8_t callbacks_enabled, linked, tx_call_active, scan_fetch_pending, scan_command_active;
+static uint8_t callbacks_enabled, linked, scan_fetch_pending, scan_command_active;
+static struct nbuf *tx_in_call;
+static uint8_t tx_freed_in_call;
 static uint16_t associated_frequency, scan_result_count, scan_max_results;
 static int8_t current_rssi;
 static uint32_t generation;
@@ -84,9 +87,10 @@ void *nrf70_os_memset(void *d, int v, size_t n);
 static void conn_teardown_now(void);
 
 static uint32_t now_us(void) { return platform && platform->now_us ? platform->now_us(platform->context) : 0; }
-/* Zeroization the optimizer must not elide; for credential/PMK/key buffers. */
+/* Zeroization that the optimizer must not elide; used for every buffer that
+ * ever held credential, PMK, or key material. Key material is never logged. */
 static void secure_zero(void *p, size_t n) { volatile uint8_t *d = p; while (n--) *d++ = 0; }
-static void reset_runtime(void) { nrf70_os_memset(tasklets,0,sizeof(tasklets)); nrf70_os_memset(timers,0,sizeof(timers)); nrf70_os_memset(locks,0,sizeof(locks)); event_read=event_write=event_count=0; rx_read=rx_write=rx_count=0; irq_pending=0; faulted=0; irq_data=0; irq_callback=0; scan_active=scan_suppress=0; linked=0; callbacks_enabled=0; tx_call_active=scan_fetch_pending=scan_command_active=0; associated_frequency=0; scan_result_count=scan_max_results=0; current_rssi=0; fmac_priv=0; fmac_dev=0; sta_vif_idx=MAX_NUM_VIFS; secure_zero(&conn,sizeof(conn)); secure_zero(eapol_slots,sizeof(eapol_slots)); eapol_read=eapol_write=eapol_count=0; }
+static void reset_runtime(void) { nrf70_os_memset(tasklets,0,sizeof(tasklets)); nrf70_os_memset(timers,0,sizeof(timers)); nrf70_os_memset(locks,0,sizeof(locks)); event_read=event_write=event_count=0; rx_read=rx_write=rx_count=0; irq_pending=0; faulted=0; irq_data=0; irq_callback=0; scan_active=scan_suppress=0; linked=0; callbacks_enabled=0; tx_in_call=0;tx_freed_in_call=0;scan_fetch_pending=scan_command_active=0; associated_frequency=0; scan_result_count=scan_max_results=0; current_rssi=0; fmac_priv=0; fmac_dev=0; sta_vif_idx=MAX_NUM_VIFS; secure_zero(&conn,sizeof(conn)); secure_zero(eapol_slots,sizeof(eapol_slots)); eapol_read=eapol_write=eapol_count=0; }
 static void account_call(uint32_t start) { uint32_t d = now_us() - start; if (d > counters.max_c_call_us) counters.max_c_call_us = d; }
 static void enqueue_event(const struct nrf70_facade_event *event, uint8_t terminal) {
     if (event_count == EVENT_SLOTS && terminal) { event_read = (uint8_t)((event_read + 1u) % EVENT_SLOTS); event_count--; counters.dropped_events++; }
@@ -126,8 +130,9 @@ int nrf70_os_snprintf(char *dst,size_t n,const char *fmt,...){
 
 static void *mem_alloc(size_t n){return nrf70_os_malloc(n);} static void *mem_zalloc(size_t n){return nrf70_os_calloc(1,n);} static void mem_free(void*p){nrf70_os_free(p);}
 static int log_drop(const char *f,va_list a){(void)f;(void)a;return 0;}
-/* Formatter for nrf_wifi logs: %s %c %d %u %x/%X %p with z/l modifiers;
- * anything else prints as '?'. Output is truncated to the buffer. */
+/* Minimal printf-style formatter for the nrf_wifi diagnostic logs. Covers the
+ * specifiers those logs actually use (%s, %c, %d, %u, %x/%X, %p, with z/l
+ * modifiers); anything else prints as '?'. Bounded output, no libc. */
 static void log_fmt_put(char*buf,size_t cap,size_t*w,char c){if(*w+1<cap)buf[*w]=c;(*w)++;}
 static void log_fmt_num(char*buf,size_t cap,size_t*w,unsigned long v,unsigned base,int upper){
     char tmp[2*sizeof(v)+3];unsigned i=0;
@@ -178,7 +183,32 @@ static void list_del(void*l,void*n){struct list*x=l;struct list_node*y=n;if(y->p
 static unsigned int list_len(void*l){return l?((struct list*)l)->len:0;}
 
 static void *nbuf_alloc(unsigned int size){struct nbuf*n=mem_zalloc(sizeof(*n));if(!n)return 0;n->base=mem_alloc(size);if(!n->base){mem_free(n);return 0;}n->data=n->base;n->capacity=size;counters.nbuf_in_use++;if(counters.nbuf_in_use>counters.nbuf_high_water)counters.nbuf_high_water=counters.nbuf_in_use;return n;}
-static void nbuf_free(void*p){struct nbuf*n=p;if(n){uint8_t is_tx=n->facade_tx;uint32_t token=n->tx_token;mem_free(n->base);mem_free(n);if(counters.nbuf_in_use)counters.nbuf_in_use--;if(is_tx&&callbacks_enabled){struct nrf70_facade_event e={.generation=generation,.kind=NRF70_FACADE_EVENT_TX_COMPLETE,.token=token,.status=tx_call_active?NRF70_FACADE_IO:NRF70_FACADE_OK};if(tx_call_active){counters.tx_failed++;}else{counters.tx_completed++;}enqueue_event(&e,0);}}} static void nbuf_res(void*p,unsigned int s){struct nbuf*n=p;if(n&&s<=n->capacity){n->data=n->base+s;n->len=0;}}
+/* TX_COMPLETE describes host-buffer release, not an over-the-air ACK. FMAC
+ * can release a successfully copied packet synchronously inside start_xmit.
+ * Defer that packet's event until its submission result is known. */
+static void tx_complete(uint32_t token, int32_t status) {
+    if (!callbacks_enabled) return;
+    struct nrf70_facade_event e = {
+        .generation = generation, .kind = NRF70_FACADE_EVENT_TX_COMPLETE,
+        .token = token, .status = status,
+    };
+    if (status) counters.tx_failed++;
+    else counters.tx_completed++;
+    enqueue_event(&e, 0);
+}
+static void nbuf_free(void *p) {
+    struct nbuf *n = p;
+    if (!n) return;
+    uint8_t is_tx = n->facade_tx;
+    uint32_t token = n->tx_token;
+    uint8_t defer = is_tx && n == tx_in_call;
+    mem_free(n->base);
+    mem_free(n);
+    if (counters.nbuf_in_use) counters.nbuf_in_use--;
+    if (defer) tx_freed_in_call = 1;
+    else if (is_tx) tx_complete(token, NRF70_FACADE_OK);
+}
+static void nbuf_res(void*p,unsigned int s){struct nbuf*n=p;if(n&&s<=n->capacity){n->data=n->base+s;n->len=0;}}
 static unsigned int nbuf_headroom(void*p){struct nbuf*n=p;return n?(unsigned int)(n->data-n->base):0;} static unsigned int nbuf_size(void*p){return p?((struct nbuf*)p)->len:0;} static void *nbuf_data(void*p){return p?((struct nbuf*)p)->data:0;}
 static void *nbuf_put(void*p,unsigned int s){struct nbuf*n=p;if(!n||n->data-n->base+n->len+s>n->capacity)return 0;void*r=n->data+n->len;n->len+=s;return r;}
 static void *nbuf_push(void*p,unsigned int s){struct nbuf*n=p;if(!n||s>(unsigned)(n->data-n->base))return 0;n->data-=s;n->len+=s;return n->data;} static void *nbuf_pull(void*p,unsigned int s){struct nbuf*n=p;if(!n||s>n->len)return 0;n->data+=s;n->len-=s;return n->data;}
@@ -198,9 +228,10 @@ static enum nrf_wifi_status irq_reg(void*d,void*c,int(*fn)(void*)){(void)d;irq_d
 static void host_map(void*d,struct nrf_wifi_osal_host_map*m){(void)d;m->addr=0;m->size=0xFFFFFFFFu;}
 static unsigned int read32(void*p,unsigned long a){(void)p;uint32_t v=0,s=now_us();if(!platform||platform->read_reg32(platform->context,(uint32_t)a,&v)){v=0;counters.spi_errors++;fatal(NRF70_FACADE_IO,"SPI register read");}uint32_t d=now_us()-s;if(d>counters.max_spi_transfer_us)counters.max_spi_transfer_us=d;return v;}
 static void write32(void*p,unsigned long a,unsigned int v){(void)p;uint32_t s=now_us();if(!platform||platform->write_reg32(platform->context,(uint32_t)a,v)){counters.spi_errors++;fatal(NRF70_FACADE_IO,"SPI register write");}uint32_t d=now_us()-s;if(d>counters.max_spi_transfer_us)counters.max_spi_transfer_us=d;}
-/* The RPU bus moves whole 32-bit words, but driver commands and events have
- * arbitrary byte sizes, so an unaligned buffer or length bounces through a
- * zero-padded aligned copy (as Nordic's Zephyr shim does). The RPU-side
+/* The RPU bus moves whole 32-bit words, but the driver's commands and events
+ * have arbitrary byte sizes (e.g. sizeof(struct nrf_wifi_cmd_sys_init) ==
+ * 341), so transfers with an unaligned buffer or length bounce through a
+ * zero-padded aligned copy, as Nordic's Zephyr shim does. The RPU-side
  * address must stay word-aligned. Bounce buffers may carry key material and
  * are zeroed before release. */
 static void read_mem(void*p,void*d,unsigned long a,size_t n){
@@ -240,8 +271,13 @@ static void write_mem(void*p,unsigned long a,const void*s,size_t n){
 static int ps_sleep(void*p){(void)p;return platform?platform->sleep(platform->context):-1;}static int ps_wake(void*p){(void)p;return platform?platform->wake(platform->context):-1;}static int ps_status(void*p){(void)p;return platform?platform->power_status(platform->context):-1;}
 static void os_assert(int t,int v,enum nrf_wifi_assert_op_type op,char*m){int ok=0;switch(op){case NRF_WIFI_ASSERT_EQUAL_TO:ok=t==v;break;case NRF_WIFI_ASSERT_NOT_EQUAL_TO:ok=t!=v;break;case NRF_WIFI_ASSERT_LESS_THAN:ok=t<v;break;case NRF_WIFI_ASSERT_LESS_THAN_EQUAL_TO:ok=t<=v;break;case NRF_WIFI_ASSERT_GREATER_THAN:ok=t>v;break;case NRF_WIFI_ASSERT_GREATER_THAN_EQUAL_TO:ok=t>=v;break;default:ok=0;}if(!ok)fatal(NRF70_FACADE_FATAL,m?m:"nrf_wifi assert");}
 
+/* Control lists and data-memory metadata use the same arena-backed helpers
+ * as ordinary lists and allocations. The vendor OSAL calls these separate
+ * hooks unconditionally; leaving them unset branches to NULL at startup. */
 const struct nrf_wifi_osal_ops nrf_wifi_os_bm_ops = {
  .mem_alloc=mem_alloc,.mem_zalloc=mem_zalloc,.mem_free=mem_free,.mem_cpy=nrf70_os_memcpy,.mem_set=nrf70_os_memset,.mem_cmp=nrf70_os_memcmp,
+ .data_mem_zalloc=mem_zalloc,.data_mem_free=mem_free,
+ .ctrl_llist_alloc=list_alloc,.ctrl_llist_free=list_free,.ctrl_llist_node_alloc=node_alloc,.ctrl_llist_node_free=node_free,
  .qspi_read_reg32=read32,.qspi_write_reg32=write32,.qspi_cpy_from=read_mem,.qspi_cpy_to=write_mem,
  .spinlock_alloc=lock_alloc,.spinlock_free=lock_free,.spinlock_init=lock_init,.spinlock_take=lock_take,.spinlock_rel=lock_rel,.spinlock_irq_take=lock_irq_take,.spinlock_irq_rel=lock_irq_rel,
  .log_dbg=log_drop,.log_info=log_drop,.log_err=log_fmt_err,
@@ -308,7 +344,7 @@ static void fill_callbacks(struct nrf_wifi_fmac_callbk_fns*c);
 static void scan_start_cb(void*vif,struct nrf_wifi_umac_event_trigger_scan*e,unsigned int len){(void)vif;(void)e;(void)len;}
 static void scan_done_cb(void*vif,struct nrf_wifi_umac_event_trigger_scan*e,unsigned int len){(void)vif;(void)e;(void)len;if(scan_active)scan_fetch_pending=1;else if(conn.state==CONN_SCAN_WAIT)conn.scan_fetch=1;}
 static void scan_abort_cb(void*vif,struct nrf_wifi_umac_event_trigger_scan*e,unsigned int len){(void)vif;(void)e;(void)len;if(scan_suppress){scan_suppress=0;return;}if(!scan_active){if(conn.state==CONN_SCAN_WAIT)conn.scan_done=1;/* aborted connect scan: no RSN IE captured -> HANDSHAKE_FAILED */return;}scan_active=0;struct nrf70_facade_event x={.generation=generation,.kind=NRF70_FACADE_EVENT_SCAN_COMPLETE,.status=NRF70_FACADE_CANCELLED};enqueue_event(&x,1);}
-static void scan_results_cb(void*vif,struct nrf_wifi_umac_event_new_scan_display_results*results,unsigned int len,bool more){(void)vif;(void)len;if(!scan_active||!results)return;for(unsigned i=0;i<results->event_bss_count;i++){if(scan_suppress||(scan_max_results&&scan_result_count>=scan_max_results))break;struct umac_display_results*r=&results->display_results[i];struct nrf70_facade_event e={.generation=generation,.kind=NRF70_FACADE_EVENT_SCAN_RESULT};e.scan.ssid_len=r->ssid.nrf_wifi_ssid_len>32?32:r->ssid.nrf_wifi_ssid_len;nrf70_os_memcpy(e.scan.ssid,r->ssid.nrf_wifi_ssid,e.scan.ssid_len);e.scan.channel=r->nwk_channel;e.scan.band=r->nwk_band;e.scan.rssi_dbm=r->signal.signal_type==NRF_WIFI_SIGNAL_TYPE_MBM?(int8_t)(((int)r->signal.signal.mbm_signal)/100):(int8_t)r->signal.signal.unspec_signal;nrf70_os_memcpy(e.scan.bssid,r->mac_addr,6);e.scan.mfp=(r->mfp_flag&NRF_WIFI_MFP_REQUIRED)?2:((r->mfp_flag&NRF_WIFI_MFP_CAPABLE)?1:0);switch(r->security_type){case NRF_WIFI_OPEN:e.scan.security=NRF70_FACADE_SECURITY_OPEN;break;case NRF_WIFI_WPA2:e.scan.security=NRF70_FACADE_SECURITY_WPA2_PSK;break;case NRF_WIFI_WPA2_256:e.scan.security=NRF70_FACADE_SECURITY_WPA2_PSK_SHA256;break;case NRF_WIFI_WPA3:e.scan.security=NRF70_FACADE_SECURITY_WPA3_SAE;break;default:e.scan.security=NRF70_FACADE_SECURITY_OTHER;}enqueue_event(&e,0);scan_result_count++;}if(!more){scan_active=0;scan_suppress=0;counters.scans_completed++;struct nrf70_facade_event e={.generation=generation,.kind=NRF70_FACADE_EVENT_SCAN_COMPLETE};enqueue_event(&e,1);}}
+static void scan_results_cb(void*vif,struct nrf_wifi_umac_event_new_scan_display_results*results,unsigned int len,bool more){(void)vif;(void)len;if(!scan_active||!results)return;for(unsigned i=0;i<results->event_bss_count;i++){if(scan_suppress||(scan_max_results&&scan_result_count>=scan_max_results))break;struct umac_display_results*r=&results->display_results[i];struct nrf70_facade_event e={.generation=generation,.kind=NRF70_FACADE_EVENT_SCAN_RESULT};e.scan.ssid_len=r->ssid.nrf_wifi_ssid_len>32?32:r->ssid.nrf_wifi_ssid_len;nrf70_os_memcpy(e.scan.ssid,r->ssid.nrf_wifi_ssid,e.scan.ssid_len);e.scan.channel=r->nwk_channel;e.scan.band=r->nwk_band;e.scan.rssi_dbm=r->signal.signal_type==NRF_WIFI_SIGNAL_TYPE_MBM?(int8_t)(((int)r->signal.signal.mbm_signal)/100):(int8_t)r->signal.signal.unspec_signal;nrf70_os_memcpy(e.scan.bssid,r->mac_addr,6);e.scan.mfp=(r->mfp_flag&NRF_WIFI_MFP_REQUIRED)?2:((r->mfp_flag&NRF_WIFI_MFP_CAPABLE)?1:0);switch(r->security_type){case NRF_WIFI_OPEN:e.scan.security=NRF70_FACADE_SECURITY_OPEN;break;case NRF_WIFI_WPA2:e.scan.security=NRF70_FACADE_SECURITY_WPA2_PSK;break;case NRF_WIFI_WPA2_256:e.scan.security=NRF70_FACADE_SECURITY_WPA2_PSK_SHA256;break;case NRF_WIFI_WPA3_HNP:case NRF_WIFI_WPA3_H2E:case NRF_WIFI_WPA3_AUTO:case NRF_WIFI_WPA3_FT_SAE:e.scan.security=NRF70_FACADE_SECURITY_WPA3_SAE;break;default:e.scan.security=NRF70_FACADE_SECURITY_OTHER;}enqueue_event(&e,0);scan_result_count++;}if(!more){scan_active=0;scan_suppress=0;counters.scans_completed++;struct nrf70_facade_event e={.generation=generation,.kind=NRF70_FACADE_EVENT_SCAN_COMPLETE};enqueue_event(&e,1);}}
 /* Finds IE `id` in a raw element buffer; returns element length incl. the
  * 2-byte header via *out_len, or NULL. */
 static const uint8_t *find_ie(const uint8_t *ies,uint32_t len,uint8_t id,uint16_t *out_len){
@@ -329,7 +365,8 @@ static void connect_scan_res_cb(void *vif,struct nrf_wifi_umac_event_new_scan_re
     if(r&&len>=offsetof(struct nrf_wifi_umac_event_new_scan_results,ies))
         log_diag("connect scan: len=%u flags=%x ies=%u beacon=%u more=%u bssid=%02x:%02x:%02x:%02x:%02x:%02x",len,r->valid_fields,r->ies_len,r->beacon_ies_len,(unsigned)more,r->mac_addr[0],r->mac_addr[1],r->mac_addr[2],r->mac_addr[3],r->mac_addr[4],r->mac_addr[5]);
     /* The RPU-declared ies_len/beacon_ies_len must fit inside the delivered
-     * event (the HAL allocates exactly the declared message length). */
+     * event (the HAL allocates exactly the declared message length); a
+     * malformed event is ignored rather than parsed out of bounds. */
     if(r&&len>=(unsigned int)offsetof(struct nrf_wifi_umac_event_new_scan_results,ies)&&
        (uint64_t)r->ies_len+(uint64_t)r->beacon_ies_len<=
        (uint64_t)(len-offsetof(struct nrf_wifi_umac_event_new_scan_results,ies))){
@@ -439,14 +476,18 @@ int32_t nrf70_facade_init(const struct nrf70_facade_platform_ops*ops,const uint8
 int32_t nrf70_facade_deinit(void){if(!initialized)return NRF70_FACADE_NOT_INITIALIZED;callbacks_enabled=0;scan_active=0;conn_teardown_now();uint32_t s=now_us();fmac_stop();account_call(s);initialized=0;reset_runtime();platform=0;return 0;}
 int32_t nrf70_facade_reset(const uint8_t mac[6],const uint8_t country[2]){if(!initialized)return NRF70_FACADE_NOT_INITIALIZED;if(!mac||!country)return NRF70_FACADE_INVALID;callbacks_enabled=0;scan_active=0;conn_teardown_now();uint32_t s=now_us();fmac_stop();account_call(s);reset_runtime();generation++;counters.generation=generation;counters.resets++;s=now_us();int r=fmac_start(mac,country);account_call(s);if(r||faulted){initialized=0;return NRF70_FACADE_FATAL;}counters.firmware_restarts++;push_simple(NRF70_FACADE_EVENT_FIRMWARE_RESTART,0);return 0;}
 int32_t nrf70_facade_set_country(const uint8_t c[2]){if(!initialized)return NRF70_FACADE_NOT_INITIALIZED;if(!c)return NRF70_FACADE_INVALID;struct nrf_wifi_fmac_reg_info reg={0};reg.alpha2[0]=c[0];reg.alpha2[1]=c[1];reg.force=true;uint32_t s=now_us();enum nrf_wifi_status r=nrf_wifi_fmac_set_reg(fmac_dev,&reg);account_call(s);return faulted?NRF70_FACADE_FATAL:(r==NRF_WIFI_STATUS_SUCCESS?0:NRF70_FACADE_IO);}
-int32_t nrf70_facade_scan_start(const struct nrf70_facade_scan_request*q){if(!initialized)return NRF70_FACADE_NOT_INITIALIZED;if(scan_active||(conn.state!=CONN_IDLE&&conn.state!=CONN_AUTHORIZED))return NRF70_FACADE_BUSY;if(!q||q->channel_count>32||q->ssid_len>=32)return NRF70_FACADE_INVALID;/* The pinned nrf_wifi_sys_fmac_scan copies sizeof(info)+sizeof(struct nrf_wifi_channel)*num_scan_channels bytes from this buffer, so reserve a zeroed nrf_wifi_channel-sized area per channel; only the leading unsigned int frequencies are meaningful. */struct __attribute__((packed)){struct nrf_wifi_umac_scan_info info;union{unsigned int frequency[NRF70_FACADE_MAX_CHANNELS];unsigned char reserve[sizeof(struct nrf_wifi_channel)*NRF70_FACADE_MAX_CHANNELS];}ch;}scan={0};scan.info.scan_reason=SCAN_DISPLAY;scan.info.scan_params.passive_scan=q->passive;scan.info.scan_params.bands=NRF_WIFI_SCAN_BAND_5GHZ;scan.info.scan_params.dwell_time_active=q->dwell_active_ms;scan.info.scan_params.dwell_time_passive=q->dwell_passive_ms;if(q->ssid_len){scan.info.scan_params.num_scan_ssids=1;scan.info.scan_params.scan_ssids[0].nrf_wifi_ssid_len=q->ssid_len;nrf70_os_memcpy(scan.info.scan_params.scan_ssids[0].nrf_wifi_ssid,q->ssid,q->ssid_len);}for(unsigned i=0;i<q->channel_count;i++){if(q->channels[i].band!=1)return NRF70_FACADE_INVALID;int f=nrf_wifi_utils_chan_to_freq(NRF_WIFI_BAND_5GHZ,q->channels[i].channel);if(f<0)return NRF70_FACADE_INVALID;scan.ch.frequency[i]=(unsigned int)f;}scan.info.scan_params.num_scan_channels=q->channel_count;scan_active=1;scan_suppress=0;scan_result_count=0;scan_max_results=q->max_results;counters.scans_started++;uint32_t s=now_us();scan_command_active=1;enum nrf_wifi_status r=nrf_wifi_sys_fmac_scan(fmac_dev,sta_vif_idx,&scan.info);scan_command_active=0;account_call(s);if(r!=NRF_WIFI_STATUS_SUCCESS||faulted){scan_active=0;return faulted?NRF70_FACADE_FATAL:NRF70_FACADE_IO;}return 0;}
+int32_t nrf70_facade_scan_start(const struct nrf70_facade_scan_request*q){if(!initialized)return NRF70_FACADE_NOT_INITIALIZED;if(scan_active||(conn.state!=CONN_IDLE&&conn.state!=CONN_AUTHORIZED))return NRF70_FACADE_BUSY;if(!q||q->channel_count>32||q->ssid_len>=32)return NRF70_FACADE_INVALID;/* The pinned nrf_wifi_sys_fmac_scan copies sizeof(info)+sizeof(struct nrf_wifi_channel)*num_scan_channels bytes from this buffer, so reserve a zeroed nrf_wifi_channel-sized area per channel; only the leading unsigned int frequencies are meaningful on the wire (upstream semantics), the rest is zeroed facade-owned slack the FMAC over-copy may read. */struct __attribute__((packed)){struct nrf_wifi_umac_scan_info info;union{unsigned int frequency[NRF70_FACADE_MAX_CHANNELS];unsigned char reserve[sizeof(struct nrf_wifi_channel)*NRF70_FACADE_MAX_CHANNELS];}ch;}scan={0};scan.info.scan_reason=SCAN_DISPLAY;scan.info.scan_params.passive_scan=q->passive;scan.info.scan_params.bands=NRF_WIFI_SCAN_BAND_5GHZ;scan.info.scan_params.dwell_time_active=q->dwell_active_ms;scan.info.scan_params.dwell_time_passive=q->dwell_passive_ms;if(q->ssid_len){scan.info.scan_params.num_scan_ssids=1;scan.info.scan_params.scan_ssids[0].nrf_wifi_ssid_len=q->ssid_len;nrf70_os_memcpy(scan.info.scan_params.scan_ssids[0].nrf_wifi_ssid,q->ssid,q->ssid_len);}for(unsigned i=0;i<q->channel_count;i++){if(q->channels[i].band!=1)return NRF70_FACADE_INVALID;int f=nrf_wifi_utils_chan_to_freq(NRF_WIFI_BAND_5GHZ,q->channels[i].channel);if(f<0)return NRF70_FACADE_INVALID;scan.ch.frequency[i]=(unsigned int)f;}scan.info.scan_params.num_scan_channels=q->channel_count;scan_active=1;scan_suppress=0;scan_result_count=0;scan_max_results=q->max_results;counters.scans_started++;uint32_t s=now_us();scan_command_active=1;enum nrf_wifi_status r=nrf_wifi_sys_fmac_scan(fmac_dev,sta_vif_idx,&scan.info);scan_command_active=0;account_call(s);if(r!=NRF_WIFI_STATUS_SUCCESS||faulted){scan_active=0;return faulted?NRF70_FACADE_FATAL:NRF70_FACADE_IO;}return 0;}
 int32_t nrf70_facade_scan_cancel(void){if(!scan_active)return NRF70_FACADE_INVALID;scan_active=0;scan_suppress=1;counters.scans_cancelled++;nrf_wifi_sys_fmac_abort_scan(fmac_dev,sta_vif_idx);struct nrf70_facade_event e={.generation=generation,.status=NRF70_FACADE_CANCELLED,.kind=NRF70_FACADE_EVENT_SCAN_COMPLETE};enqueue_event(&e,1);return 0;}
+/* --- connect state machine + supplicant host hooks ------------------------ */
 static uint8_t conn_stepping; /* sleep_ms() re-enters process(); never re-enter wpa_sm */
 static void conn_reset(void){secure_zero(&conn,sizeof(conn));secure_zero(eapol_slots,sizeof(eapol_slots));eapol_read=eapol_write=eapol_count=0;}
 static void conn_fail_ex(int32_t status,uint16_t reason){counters.handshake_failures++;struct nrf70_facade_event e={.generation=generation,.kind=NRF70_FACADE_EVENT_HANDSHAKE_FAILED,.status=status,.reason_code=reason,.frequency_mhz=associated_frequency};enqueue_event(&e,1);conn.teardown=1;}
 static void conn_fail(uint16_t reason){conn_fail_ex(NRF70_FACADE_IO,reason);}
-/* Bounds-checked parse of the AP RSN IE (tag 48); returns non-zero when
- * malformed. Trailing fields (PMKID list, group mgmt suite) are ignored. */
+/* Bounded parse of the captured AP RSN IE (tag 48, body after the 2-byte
+ * element header): version, group suite, pairwise list, AKM list (collecting
+ * PSK / PSK-SHA256), optional RSN capabilities (MFPC/MFPR). Every read is
+ * bounds-checked; returns non-zero on any malformed structure. Trailing
+ * fields (PMKID list, group mgmt suite) are ignored. */
 struct conn_rsn_info { uint8_t has_psk, has_psk_sha256, group_ccmp, pairwise_ccmp, mfpc, mfpr; };
 static int rsn_suite_is_ccmp(const uint8_t *s){return s[0]==0&&s[1]==0x0f&&s[2]==0xac&&s[3]==4;}
 static int conn_parse_rsn(const uint8_t *ie,uint16_t ie_len,struct conn_rsn_info *out){
@@ -483,9 +524,13 @@ static int conn_parse_rsn(const uint8_t *ie,uint16_t ie_len,struct conn_rsn_info
 }
 /* Called at process() top level only (never from FMAC callback context). */
 static void conn_teardown_now(void){
-    /* Abort a connect scan still running in the RPU so it cannot leak stale
-     * results into a later attempt. !scan_active leaves a display scan alone;
-     * the stale abort/done event arrives after CONN_IDLE and is ignored. */
+    /* A connect-reason scan may still be running in the RPU; abort it so it
+     * cannot collide with (or leak stale results into) a later attempt. The
+     * connect scan and the display scan are mutually exclusive via the BUSY
+     * checks, and the !scan_active guard keeps a display scan (and its
+     * scan_suppress bookkeeping) untouched. The stale abort/done event lands
+     * in scan_abort_cb/scan_done_cb after conn is reset to CONN_IDLE, where it
+     * is ignored. */
     if((conn.state==CONN_SCAN_START||conn.state==CONN_SCAN_WAIT)&&!scan_active&&fmac_dev&&sta_vif_idx<MAX_NUM_VIFS)
         nrf_wifi_sys_fmac_abort_scan(fmac_dev,sta_vif_idx);
     nrf70_supp_stop();conn_reset();
@@ -729,7 +774,38 @@ int32_t nrf70_facade_key_install(const struct nrf70_facade_key*k){if(!initialize
 int32_t nrf70_facade_key_remove(const struct nrf70_facade_key*k){if(!initialized)return NRF70_FACADE_NOT_INITIALIZED;struct nrf_wifi_umac_key_info i;if(!convert_key(k,&i))return NRF70_FACADE_INVALID;return nrf_wifi_sys_fmac_del_key(rpu_ctx(),vif_idx(),&i,(const char*)k->peer)==NRF_WIFI_STATUS_SUCCESS?0:NRF70_FACADE_IO;}
 int32_t nrf70_facade_controlled_port(uint8_t authorized,const uint8_t peer[6]){if(!initialized)return NRF70_FACADE_NOT_INITIALIZED;if(!peer)return NRF70_FACADE_INVALID;struct nrf_wifi_umac_chg_sta_info i={0};i.sta_flags2.nrf_wifi_mask=NRF_WIFI_STA_FLAG_AUTHORIZED;i.sta_flags2.nrf_wifi_set=authorized?NRF_WIFI_STA_FLAG_AUTHORIZED:0;nrf70_os_memcpy(i.mac_addr,peer,6);return nrf_wifi_sys_fmac_chg_sta(rpu_ctx(),vif_idx(),&i)==NRF_WIFI_STATUS_SUCCESS?0:NRF70_FACADE_IO;}
 int32_t nrf70_facade_set_power_save(uint8_t enabled){if(!initialized)return NRF70_FACADE_NOT_INITIALIZED;return nrf_wifi_sys_fmac_set_power_save(rpu_ctx(),vif_idx(),enabled!=0)==NRF_WIFI_STATUS_SUCCESS?0:NRF70_FACADE_IO;}
-int32_t nrf70_facade_tx(uint32_t token,const uint8_t*frame,uint16_t length){if(!initialized)return NRF70_FACADE_NOT_INITIALIZED;if(!linked)return NRF70_FACADE_NOT_CONNECTED;/* Hold ordinary data while a secured connect session exists but the controlled port is not yet authorized (EAPOL bypasses this via nrf70_supp_host_ether_send). */if(conn.secured&&conn.state!=CONN_IDLE&&conn.state!=CONN_AUTHORIZED)return NRF70_FACADE_NOT_CONNECTED;if(!frame||length<14||length>NRF70_FACADE_MAX_FRAME_LEN)return NRF70_FACADE_INVALID;struct nbuf*n=nbuf_alloc((unsigned int)length+TX_HEADROOM);if(!n)return NRF70_FACADE_NO_MEMORY;nbuf_res(n,TX_HEADROOM);void*d=nbuf_put(n,length);if(!d){nbuf_free(n);return NRF70_FACADE_NO_MEMORY;}nrf70_os_memcpy(d,frame,length);counters.tx_copies++;n->facade_tx=1;n->tx_token=token;counters.tx_submitted++;tx_call_active=1;enum nrf_wifi_status r=nrf_wifi_fmac_start_xmit(rpu_ctx(),vif_idx(),n);tx_call_active=0;if(r!=NRF_WIFI_STATUS_SUCCESS){counters.tx_queue_full++;return NRF70_FACADE_QUEUE_FULL;}return 0;}
+int32_t nrf70_facade_tx(uint32_t token, const uint8_t *frame, uint16_t length) {
+    if (!initialized) return NRF70_FACADE_NOT_INITIALIZED;
+    if (!linked) return NRF70_FACADE_NOT_CONNECTED;
+    /* EAPOL bypasses this controlled-port gate via the supplicant. */
+    if (conn.secured && conn.state != CONN_IDLE && conn.state != CONN_AUTHORIZED)
+        return NRF70_FACADE_NOT_CONNECTED;
+    if (!frame || length < 14 || length > NRF70_FACADE_MAX_FRAME_LEN)
+        return NRF70_FACADE_INVALID;
+    struct nbuf *n = nbuf_alloc((unsigned int)length + TX_HEADROOM);
+    if (!n) return NRF70_FACADE_NO_MEMORY;
+    nbuf_res(n, TX_HEADROOM);
+    void *d = nbuf_put(n, length);
+    if (!d) { nbuf_free(n); return NRF70_FACADE_NO_MEMORY; }
+    nrf70_os_memcpy(d, frame, length);
+    counters.tx_copies++;
+    n->facade_tx = 1;
+    n->tx_token = token;
+    counters.tx_submitted++;
+    tx_in_call = n;
+    tx_freed_in_call = 0;
+    enum nrf_wifi_status r = nrf_wifi_fmac_start_xmit(rpu_ctx(), vif_idx(), n);
+    tx_in_call = 0;
+    if (tx_freed_in_call) {
+        tx_freed_in_call = 0;
+        tx_complete(token, r == NRF_WIFI_STATUS_SUCCESS ? NRF70_FACADE_OK : NRF70_FACADE_IO);
+    }
+    if (r != NRF_WIFI_STATUS_SUCCESS) {
+        counters.tx_queue_full++;
+        return NRF70_FACADE_QUEUE_FULL;
+    }
+    return NRF70_FACADE_OK;
+}
 int32_t nrf70_facade_rx_pop(uint8_t*frame,uint16_t capacity,struct nrf70_facade_rx_meta*meta){if(!frame||!meta)return NRF70_FACADE_INVALID;if(!rx_count)return 0;struct rx_slot*s=&rx_slots[rx_read];if(capacity<s->length)return NRF70_FACADE_INVALID;nrf70_os_memcpy(frame,s->frame,s->length);nrf70_os_memset(meta,0,sizeof(*meta));meta->generation=generation;meta->length=s->length;meta->rssi_dbm=s->rssi;rx_read=(uint8_t)((rx_read+1u)%RX_SLOTS);rx_count--;counters.rx_delivered++;return 1;}
 void nrf70_facade_notify_host_irq(void){irq_pending=1;}
 uint32_t nrf70_facade_process(uint32_t budget){if(faulted)return 0;uint32_t ran=0;while(ran<budget){uint8_t did=0;if(irq_pending&&irq_callback&&ran<budget){irq_pending=0;irq_callback(irq_data);ran++;did=1;}if(scan_fetch_pending&&!scan_command_active&&ran<budget){scan_fetch_pending=0;if(nrf_wifi_sys_fmac_scan_res_get(fmac_dev,sta_vif_idx,SCAN_DISPLAY)!=NRF_WIFI_STATUS_SUCCESS)fatal(NRF70_FACADE_IO,"scan result fetch");ran++;did=1;}if((conn.state!=CONN_IDLE||conn.teardown)&&!conn_stepping&&!scan_command_active&&ran<budget&&conn_step()){ran++;did=1;}if(!conn_stepping&&nrf70_supp_active()&&ran<budget){conn_stepping=1;uint32_t t=nrf70_supp_eloop_poll(now_us());conn_stepping=0;if(t){ran++;did=1;}}for(unsigned i=0;i<TASKLET_SLOTS&&ran<budget;i++)if(tasklets[i].used&&tasklets[i].pending){tasklets[i].pending=0;if(tasklets[i].fn)tasklets[i].fn(tasklets[i].data);ran++;did=1;}uint32_t n=now_us();for(unsigned i=0;i<TIMER_SLOTS&&ran<budget;i++)if(timers[i].used&&timers[i].armed&&(int32_t)(n-timers[i].deadline)>=0){timers[i].armed=0;if(timers[i].fn)timers[i].fn(timers[i].data);ran++;did=1;}if(!did)break;}return ran;}

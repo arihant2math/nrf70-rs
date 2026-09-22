@@ -7,12 +7,12 @@ clang = "21.1.8"
 
 [nrf70_bm]
 url = "https://github.com/nrfconnect/nrf70-bm.git"
-commit = "21b6ed5921c93732db926a79ea2232655e0f2805"
+commit = "185ec021afb61dc2d42b4f65800c3aa3d27c88d6"
 license = "BSD-3-Clause (per-file SPDX)"
 
 [nrf_wifi]
 url = "https://github.com/zephyrproject-rtos/nrf_wifi.git"
-commit = "8e3a55124fa5e93f7a8fba5f5338e9d5a86d01fb"
+commit = "0aaa9aa812877cb6bc020df8260d0607a3f0ec1a"
 license = "BSD-3-Clause (selected source files)"
 
 [hostap]
@@ -25,13 +25,13 @@ archive = "nrf70_supplicant (second cc archive; libc calls interposed to nrf70_o
 
 [nrfxlib]
 url = "https://github.com/nrfconnect/sdk-nrfxlib.git"
-commit = "c2efece046154752d9b926bc9e319fd665fa371d"
+commit = "f1591c62b301c2dc8d91308d43903de563f64d81"
 license_file = "third_party/nrf70-bm/sdk-nrfxlib/LICENSE"
 
 [firmware]
 path = "sdk-nrfxlib/nrf_wifi/bin/zephyr/default/nrf70.bin"
-version = "1.2.13.22"
-sha256 = "5a71780725e82feaf76363e0512157bf22a8c2d3c86cd8549928a7c289a27fe5"
+version = "1.2.14.9"
+sha256 = "36b84d10037a9609a2a0fe86a0ef5b53fcd5fc2e88621c6d8f0f711b76775b1e"
 license = "LicenseRef-Nordic-5-Clause"
 
 [configuration]

@@ -241,7 +241,9 @@ int32_t nrf70_facade_key_install(const struct nrf70_facade_key *key);
 int32_t nrf70_facade_key_remove(const struct nrf70_facade_key *key);
 int32_t nrf70_facade_controlled_port(uint8_t authorized, const uint8_t peer[6]);
 int32_t nrf70_facade_set_power_save(uint8_t enabled);
-/* Copies the frame into a C-owned nbuf. token is returned by TX_COMPLETE. */
+/* Copies the frame into a C-owned nbuf. token is returned by TX_COMPLETE
+ * when FMAC releases the host buffer (possibly synchronously on submission).
+ * This is not an over-the-air ACK; a successful release cannot prove delivery. */
 int32_t nrf70_facade_tx(uint32_t token, const uint8_t *frame, uint16_t length);
 /* Atomically copies and releases one queued C RX buffer. 0 means no frame, 1 means copied. */
 int32_t nrf70_facade_rx_pop(uint8_t *frame, uint16_t capacity,
