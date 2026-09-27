@@ -63,7 +63,7 @@ enum nrf70_facade_key_type {
 };
 
 struct nrf70_facade_channel {
-    uint8_t band;    /* 1 is 5 GHz; other values are rejected by the safe crate. */
+    uint8_t band;    /* 0 is 2.4 GHz, 1 is 5 GHz. */
     uint8_t channel;
 };
 

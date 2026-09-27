@@ -17,11 +17,12 @@ are application-selected and should remain small and measured.
 
 ```rust,ignore
 static RESOURCES: StaticCell<nrf70::Resources> = StaticCell::new();
+static ARENA: nrf70::Arena<131_072> = nrf70::Arena::new();
 static PLATFORM: StaticCell<nrf70::Platform<MyNrf54Spim, 131_072>> = StaticCell::new();
 static NET: StaticCell<nrf70::EthernetState<4, 4>> = StaticCell::new();
 
 let resources = RESOURCES.init(nrf70::Resources::new());
-let platform = PLATFORM.init(nrf70::Platform::new(MyNrf54Spim::new(/* owned pins */)));
+let platform = PLATFORM.init(nrf70::Platform::new(MyNrf54Spim::new(/* owned pins */), &ARENA));
 let net_state = NET.init(nrf70::EthernetState::new());
 let (wifi, runner, device, host_irq) =
     nrf70::new_with_data_plane(resources, platform, net_state);

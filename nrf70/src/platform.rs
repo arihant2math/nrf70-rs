@@ -48,20 +48,26 @@ fn word_aligned(address: u32, buffer: &[u8]) -> bool {
 
 /// Rust-owned platform state: hardware tokens plus a dedicated bounded control arena.
 /// Put this value in a `StaticCell`; no unconstrained global allocator is used.
+///
+/// The arena is borrowed rather than owned so it can be a plain `static`:
+/// `Arena::new()` is const and all zero, so it lands in `.bss`, whereas a
+/// `Platform` built at runtime is assembled on the stack before it is moved
+/// into its cell, and the arena is usually far larger than the stack.
 pub struct Platform<B, const ARENA: usize> {
     bus: UnsafeCell<B>,
-    arena: Arena<ARENA>,
+    arena: &'static Arena<ARENA>,
 }
 unsafe impl<B: Send, const N: usize> Sync for Platform<B, N> {}
 impl<B, const N: usize> Platform<B, N> {
-    pub const fn new(bus: B) -> Self {
+    /// `arena` must be used by no other `Platform`.
+    pub const fn new(bus: B, arena: &'static Arena<N>) -> Self {
         Self {
             bus: UnsafeCell::new(bus),
-            arena: Arena::new(),
+            arena,
         }
     }
     pub fn arena(&self) -> &Arena<N> {
-        &self.arena
+        self.arena
     }
 }
 impl<B: Bus + Send, const N: usize> Platform<B, N> {

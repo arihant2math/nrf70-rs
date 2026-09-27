@@ -36,7 +36,18 @@ pub type EthernetState<const RX: usize, const TX: usize> =
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Band {
+    TwoGhz,
     FiveGhz,
+}
+impl Band {
+    pub const fn frequency_mhz(self, channel: u8) -> Option<u16> {
+        match (self, channel) {
+            (Self::TwoGhz, 1..=13) => Some(2407 + channel as u16 * 5),
+            (Self::TwoGhz, 14) => Some(2484),
+            (Self::FiveGhz, 1..=196) => Some(5000 + channel as u16 * 5),
+            _ => None,
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Country([u8; 2]);
@@ -52,11 +63,11 @@ impl Country {
         self.0
     }
 }
+/// With no `channels`, both bands are scanned.
 #[derive(Clone, Debug)]
 pub struct ScanRequest {
-    pub band: Band,
     pub country: Country,
-    pub channels: Vec<u8, 32>,
+    pub channels: Vec<(Band, u8), 32>,
     pub ssid_filter: Vec<u8, 32>,
     pub passive: bool,
     pub dwell_active_ms: u16,
@@ -64,9 +75,8 @@ pub struct ScanRequest {
     pub max_results: u16,
 }
 impl ScanRequest {
-    pub fn five_ghz(country: Country) -> Self {
+    pub fn all_bands(country: Country) -> Self {
         Self {
-            band: Band::FiveGhz,
             country,
             channels: Vec::new(),
             ssid_filter: Vec::new(),
@@ -89,6 +99,7 @@ pub enum Security {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AccessPoint {
     pub ssid: Vec<u8, 32>,
+    pub band: Band,
     pub channel: u8,
     pub rssi_dbm: i8,
     pub bssid: [u8; 6],
@@ -96,16 +107,9 @@ pub struct AccessPoint {
     pub mfp: u8,
 }
 
-pub const fn channel_to_5ghz_frequency(channel: u8) -> Option<u16> {
-    if channel >= 1 && channel <= 196 {
-        Some(5000 + channel as u16 * 5)
-    } else {
-        None
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BandPolicy {
+    Any,
     FiveGhzOnly,
 }
 /// Protected Management Frames policy for the association.
@@ -169,7 +173,8 @@ impl core::fmt::Debug for Credential {
     }
 }
 /// One connect request. When `bssid` and `frequency_mhz` are not both given,
-/// `connect` first scans (5 GHz, SSID-filtered) and picks the best-RSSI
+/// `connect` first scans (SSID-filtered, both bands unless `band` says
+/// otherwise) and picks the best-RSSI
 /// compatible AP; whichever of the two is given filters the candidates, and
 /// the connect frequency always comes from the picked AP's own channel.
 #[derive(Debug)]
@@ -515,7 +520,12 @@ impl Wifi<'_> {
         &self,
         request: ScanRequest,
     ) -> Result<Vec<AccessPoint, MAX_SCAN_RESULTS>, Error> {
-        if request.channels.iter().any(|c| *c == 0 || *c > 196) || request.ssid_filter.len() >= 32 {
+        if request
+            .channels
+            .iter()
+            .any(|(band, channel)| band.frequency_mhz(*channel).is_none())
+            || request.ssid_filter.len() >= 32
+        {
             return Err(Error::InvalidRequest);
         }
         let mut g = self.guard(true)?;
@@ -541,13 +551,15 @@ impl Wifi<'_> {
     }
     /// Picks the best-RSSI AP whose security fits the credential.
     async fn select_ap(&self, request: &ConnectRequest) -> Result<([u8; 6], u16, Security), Error> {
-        let mut scan = ScanRequest::five_ghz(request.country);
+        let mut scan = ScanRequest::all_bands(request.country);
         scan.ssid_filter = request.ssid.clone();
         let aps = self.scan(scan).await?;
         let mut best: Option<&AccessPoint> = None;
         let mut ssid_seen = false;
         for ap in aps.iter() {
-            if ap.ssid != request.ssid {
+            if ap.ssid != request.ssid
+                || (request.band == BandPolicy::FiveGhzOnly && ap.band != Band::FiveGhz)
+            {
                 continue;
             }
             if let Some(wanted) = request.bssid
@@ -556,7 +568,7 @@ impl Wifi<'_> {
                 continue;
             }
             if let Some(wanted) = request.frequency_mhz
-                && channel_to_5ghz_frequency(ap.channel) != Some(wanted)
+                && ap.band.frequency_mhz(ap.channel) != Some(wanted)
             {
                 continue;
             }
@@ -577,7 +589,10 @@ impl Wifi<'_> {
                 Error::NotFound
             });
         };
-        let frequency_mhz = channel_to_5ghz_frequency(ap.channel).ok_or(Error::InvalidRequest)?;
+        let frequency_mhz = ap
+            .band
+            .frequency_mhz(ap.channel)
+            .ok_or(Error::InvalidRequest)?;
         Ok((ap.bssid, frequency_mhz, ap.security))
     }
     /// `Ok(())` means the link is usable: open networks complete on link-up,
@@ -587,10 +602,11 @@ impl Wifi<'_> {
         if request.ssid.is_empty() {
             return Err(Error::InvalidRequest);
         }
-        let BandPolicy::FiveGhzOnly = request.band;
         let (bssid, frequency_mhz, security) = match (request.bssid, request.frequency_mhz) {
             (Some(bssid), Some(frequency_mhz)) => {
-                if !(4900..=5900).contains(&frequency_mhz) {
+                let five_ghz = (4900..=5900).contains(&frequency_mhz);
+                let two_ghz = (2412..=2484).contains(&frequency_mhz);
+                if !(five_ghz || (two_ghz && request.band == BandPolicy::Any)) {
                     return Err(Error::InvalidRequest);
                 }
                 let security = match &request.credential {
@@ -919,10 +935,10 @@ impl<B: Bus + Send + 'static, const N: usize> Runner<'_, B, N> {
             ..Default::default()
         };
         r.ssid[..q.ssid_filter.len()].copy_from_slice(&q.ssid_filter);
-        for (i, c) in q.channels.iter().enumerate() {
+        for (i, (band, channel)) in q.channels.iter().enumerate() {
             r.channels[i] = nrf70_sys::Channel {
-                band: 1,
-                channel: *c,
+                band: (*band == Band::FiveGhz) as u8,
+                channel: *channel,
             }
         }
         unsafe { nrf70_sys::scan_start(&r) }.map_err(Error::from)
@@ -1014,6 +1030,11 @@ impl<B: Bus + Send + 'static, const N: usize> Runner<'_, B, N> {
             let _ = ssid.extend_from_slice(&result.ssid[..result.ssid_len.min(32) as usize]);
             let ap = AccessPoint {
                 ssid,
+                band: if result.band == 0 {
+                    Band::TwoGhz
+                } else {
+                    Band::FiveGhz
+                },
                 channel: result.channel,
                 rssi_dbm: result.rssi_dbm,
                 bssid: result.bssid,
