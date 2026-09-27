@@ -32,6 +32,9 @@ pub const CREDENTIAL_PSK: u8 = 2;
 pub const MFP_DISABLED: u8 = 0;
 pub const MFP_OPTIONAL: u8 = 1;
 pub const MFP_REQUIRED: u8 = 2;
+/// `enum nrf70_facade_coex_sr_protocol` values for [`coex_configure`].
+pub const COEX_SR_BLE: u8 = 0;
+pub const COEX_SR_IEEE802154: u8 = 1;
 /// Per entry: compile-time size (and optional `align`) assertion on the bindgen
 /// struct, plus a run-time check against the C side's own `sizeof` (and
 /// `alignof` with `probe`).
@@ -531,6 +534,14 @@ pub unsafe fn controlled_port(authorized: bool, peer: [u8; 6]) -> Result<(), Sta
 /// # Safety Call only from the serialized runner.
 pub unsafe fn set_power_save(enabled: bool) -> Result<(), Status> {
     result(unsafe { raw::nrf70_facade_set_power_save(enabled as u8) })
+}
+/// # Safety Call only from the serialized runner.
+pub unsafe fn coex_configure(sr_protocol: u8) -> Result<(), Status> {
+    result(unsafe { raw::nrf70_facade_coex_configure(sr_protocol) })
+}
+/// # Safety Call only from the serialized runner.
+pub unsafe fn coex_reset() -> Result<(), Status> {
+    result(unsafe { raw::nrf70_facade_coex_reset() })
 }
 /// Copies `frame` into a C-owned nbuf before returning.
 /// # Safety Call only from the serialized runner.

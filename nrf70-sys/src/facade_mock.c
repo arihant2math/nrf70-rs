@@ -55,7 +55,7 @@ int32_t nrf70_facade_connect_start(const struct nrf70_facade_connect_request *q)
     if (!initialized) return NRF70_FACADE_NOT_INITIALIZED;
     if (conn_active) return NRF70_FACADE_BUSY;
     if (!q || q->ssid_len < 1 || q->ssid_len > NRF70_FACADE_MAX_SSID_LEN) return NRF70_FACADE_INVALID;
-    if (q->frequency_mhz < 4900 || q->frequency_mhz > 5900) return NRF70_FACADE_INVALID;
+    if (!(q->frequency_mhz >= 2412 && q->frequency_mhz <= 2484) && !(q->frequency_mhz >= 4900 && q->frequency_mhz <= 5900)) return NRF70_FACADE_INVALID;
     if (q->mfp > 2) return NRF70_FACADE_INVALID;
     if (q->security == NRF70_FACADE_SECURITY_OPEN) {
         if (q->credential_kind != NRF70_FACADE_CREDENTIAL_NONE) return NRF70_FACADE_INVALID;
@@ -103,6 +103,8 @@ int32_t nrf70_facade_key_install(const struct nrf70_facade_key *k){return initia
 int32_t nrf70_facade_key_remove(const struct nrf70_facade_key *k){return initialized&&k?0:NRF70_FACADE_INVALID;}
 int32_t nrf70_facade_controlled_port(uint8_t a,const uint8_t p[6]){if(!initialized||!p)return NRF70_FACADE_INVALID;authorized=a?1:0;return 0;}
 int32_t nrf70_facade_set_power_save(uint8_t e){(void)e;return initialized?0:NRF70_FACADE_NOT_INITIALIZED;}
+int32_t nrf70_facade_coex_configure(uint8_t sr){if(!initialized)return NRF70_FACADE_NOT_INITIALIZED;return sr>NRF70_FACADE_COEX_SR_IEEE802154?NRF70_FACADE_INVALID:0;}
+int32_t nrf70_facade_coex_reset(void){return initialized?0:NRF70_FACADE_NOT_INITIALIZED;}
 int32_t nrf70_facade_tx(uint32_t token,const uint8_t *frame,uint16_t len){
     if(!initialized) return NRF70_FACADE_NOT_INITIALIZED; if(!linked||(secured&&!authorized))return NRF70_FACADE_NOT_CONNECTED;
     if(!frame||len<14||len>NRF70_FACADE_MAX_FRAME_LEN)return NRF70_FACADE_INVALID;

@@ -62,6 +62,12 @@ enum nrf70_facade_key_type {
     NRF70_FACADE_KEY_PEER = 2
 };
 
+/* The host protocol the nRF7002's PTA shares 2.4 GHz with; selects the table. */
+enum nrf70_facade_coex_sr_protocol {
+    NRF70_FACADE_COEX_SR_BLE = 0,
+    NRF70_FACADE_COEX_SR_IEEE802154 = 1
+};
+
 struct nrf70_facade_channel {
     uint8_t band;    /* 0 is 2.4 GHz, 1 is 5 GHz. */
     uint8_t channel;
@@ -241,6 +247,12 @@ int32_t nrf70_facade_key_install(const struct nrf70_facade_key *key);
 int32_t nrf70_facade_key_remove(const struct nrf70_facade_key *key);
 int32_t nrf70_facade_controlled_port(uint8_t authorized, const uint8_t peer[6]);
 int32_t nrf70_facade_set_power_save(uint8_t enabled);
+/* Programs the RPU's coexistence hardware with the separate-antenna 2.4 GHz
+ * PTA tables for sr_protocol (enum nrf70_facade_coex_sr_protocol). The RPU
+ * forgets them on reset, so reissue after every FIRMWARE_RESTART. */
+int32_t nrf70_facade_coex_configure(uint8_t sr_protocol);
+/* Holds the coexistence hardware in reset: the PTA stops arbitrating. */
+int32_t nrf70_facade_coex_reset(void);
 /* Copies the frame into a C-owned nbuf. token is returned by TX_COMPLETE
  * when FMAC releases the host buffer (possibly synchronously on submission).
  * This is not an over-the-air ACK; a successful release cannot prove delivery. */

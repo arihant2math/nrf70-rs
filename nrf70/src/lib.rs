@@ -112,6 +112,14 @@ pub enum BandPolicy {
     Any,
     FiveGhzOnly,
 }
+/// The host protocol the nRF7002's Packet Traffic Arbiter shares 2.4 GHz
+/// with; the PTA tables differ for the two. Pick `Ieee802154` when both run.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum SrProtocol {
+    Ble,
+    Ieee802154,
+}
 /// Protected Management Frames policy for the association.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Mfp {
@@ -289,6 +297,10 @@ enum Command {
     SetPowerSave {
         id: u32,
         enabled: bool,
+    },
+    Coex {
+        id: u32,
+        protocol: Option<SrProtocol>,
     },
     Reset {
         id: u32,
@@ -674,6 +686,14 @@ impl Wifi<'_> {
         self.simple(|id| Command::SetPowerSave { id, enabled })
             .await
     }
+    /// With a protocol, programs the RPU's 2.4 GHz separate-antenna PTA tables
+    /// so the nRF7002 arbitrates the host radio's COEX_REQ; with `None`, holds
+    /// the coexistence hardware in reset. The RPU forgets the tables on every
+    /// firmware restart, so reapply after `initialize` and
+    /// `LinkEvent::FirmwareRestart`.
+    pub async fn configure_coex(&self, protocol: Option<SrProtocol>) -> Result<(), Error> {
+        self.simple(|id| Command::Coex { id, protocol }).await
+    }
     pub async fn reset(&self) -> Result<(), Error> {
         self.simple(|id| Command::Reset { id }).await
     }
@@ -776,6 +796,7 @@ impl<B: Bus + Send + 'static, const N: usize> Runner<'_, B, N> {
             Command::Connect { id } => self.cmd_connect(id),
             Command::Disconnect { id, reason } => self.cmd_disconnect(id, reason),
             Command::SetPowerSave { id, enabled } => self.cmd_set_power_save(id, enabled),
+            Command::Coex { id, protocol } => self.cmd_coex(id, protocol),
             Command::Reset { id } => self.cmd_reset(id),
             Command::Shutdown { id } => self.cmd_shutdown(id),
             Command::Stats { id } => self.cmd_stats(id),
@@ -882,6 +903,20 @@ impl<B: Bus + Send + 'static, const N: usize> Runner<'_, B, N> {
             id,
             result: unsafe { nrf70_sys::set_power_save(enabled) }.map_err(Error::from),
         })
+    }
+    fn cmd_coex(&mut self, id: u32, protocol: Option<SrProtocol>) {
+        let result = unsafe {
+            match protocol {
+                Some(SrProtocol::Ble) => nrf70_sys::coex_configure(nrf70_sys::COEX_SR_BLE),
+                Some(SrProtocol::Ieee802154) => {
+                    nrf70_sys::coex_configure(nrf70_sys::COEX_SR_IEEE802154)
+                }
+                None => nrf70_sys::coex_reset(),
+            }
+        }
+        .map_err(Error::from);
+        self.fatal_if_needed(&result);
+        self.terminal(Response::Done { id, result })
     }
     fn cmd_reset(&mut self, id: u32) {
         let result = self.reset_driver();

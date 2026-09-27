@@ -23,6 +23,19 @@ subset = "STA-only WPA2-Personal supplicant: rsn_supp/{wpa,wpa_ie,pmksa_cache}, 
 compile_defines = ["CONFIG_NO_STDOUT_DEBUG", "CONFIG_NO_WPA_MSG", "CONFIG_NO_HOSTAPD_LOGGER", "CONFIG_NO_RANDOM_POOL", "CONFIG_NO_RC4", "CONFIG_NO_TKIP", "CONFIG_CRYPTO_INTERNAL", "CONFIG_FIPS"]
 archive = "nrf70_supplicant (second cc archive; libc calls interposed to nrf70_os_*)"
 
+[zephyr_coex]
+# The PTA coexistence tables live in the Zephyr tree, not in nrf70-bm, so
+# they are copied into vendor/zephyr_nrf_wifi instead of a submodule.
+url = "https://github.com/zephyrproject-rtos/zephyr.git"
+commit = "7c1cd4c569aaea9e25c2b4cb1b1630619b6d3be1"
+license = "Apache-2.0 (per-file SPDX)"
+files = [
+    "drivers/wifi/nrf_wifi/inc/coex_struct.h -> vendor/zephyr_nrf_wifi/coex_struct.h (verbatim, sha256 de3107a4f32f351ec990be3e6e3c386d8e7ffba99f9eaea4f3cff3d5ca3cf6b5)",
+    "drivers/wifi/nrf_wifi/src/coex.c -> vendor/zephyr_nrf_wifi/coex.c (modified; upstream sha256 0cc7e27cfd87bc81b69f907c96999ff4d708d1a6459c76b9529f6fd71cadbbd7)",
+    "drivers/wifi/nrf_wifi/inc/coex.h -> vendor/zephyr_nrf_wifi/coex.h (modified; upstream sha256 658b205b3a38d5a81488e9ecf71b358b4ddc1b8a03bd4e9b2efea4742a7c2e41)",
+]
+subset = "separate-antenna PTA and non-PTA tables and the hardware reset; shared-antenna tables and the SR RF-switch code are not vendored"
+
 [nrfxlib]
 url = "https://github.com/nrfconnect/sdk-nrfxlib.git"
 commit = "f1591c62b301c2dc8d91308d43903de563f64d81"
@@ -36,10 +49,11 @@ license = "LicenseRef-Nordic-5-Clause"
 
 [configuration]
 mode = "system (STA data plane)"
-compile_defines = ["NRF70_STA_MODE=1", "NRF70_DATA_TX=1"]
+compile_defines = ["NRF70_STA_MODE=1", "NRF70_DATA_TX=1", "NRF70_SR_COEX=1", "NRF70_BT_SLOT_TIME=100", "NRF70_SR_COEX_SLEEP_CTRL_GPIO_CTRL=1"]
 physical_bus = "SPI through OSAL QSPI-shaped operations"
 board_power_ceilings = "nRF7002 EK/EB development hardware only; replace with measured custom-board values before production"
-operating_band = "5 GHz"
+operating_band = "2.4 GHz + 5 GHz"
+sr_coex = "3-wire PTA, separate antennas; COEX_GRANT active low"
 low_power = true
 control_arena_bytes_recommended = 131072
 ssid_slots = 2
@@ -47,6 +61,7 @@ manual_channel_slots = 32
 event_tasklet_slice = 1 # checked restartable patch to hal_api_common.c
 event_fetch_slice = 1   # reschedules a software IRQ after a full slice, even if HOST_IRQ drops
 open_auth_bssid_patch = true # checked patch to pinned fmac_api.c; upstream omits the valid bit
+coex_config_event_patch = true # checked patch to pinned fmac_event.c; accepts NRF_WIFI_EVENT_COEX_CONFIG
 tx_tokens = 5
 tx_pending_queue = 8
 rx_buffers = 6

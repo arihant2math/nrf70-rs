@@ -51,6 +51,18 @@ wifi.connect(nrf70::ConnectRequest {
 operations receive four-byte-aligned addresses, buffers, and lengths. Use
 blocking SPIM only; never bridge a C callback to an async future.
 
+## Coexistence with the host's 2.4 GHz radio
+
+On 2.4 GHz the nRF7002's Packet Traffic Arbiter arbitrates the host radio
+over the 3-wire `COEX_REQ`/`COEX_STATUS0`/`COEX_GRANT` interface. The firmware
+is built with the RPU's coexistence manager enabled, and `initialize`
+configures `COEX_GRANT` as active low. `Wifi::configure_coex(Some(protocol))`
+then sends the separate-antenna 2.4 GHz PTA tables (vendored from Zephyr) for
+the host's BLE or 802.15.4 traffic, and `configure_coex(None)` holds the
+coexistence hardware in reset. The RPU forgets the tables on every restart, so
+reapply them after `initialize` and `LinkEvent::FirmwareRestart`. The host
+side of the interface is the application's job.
+
 ## Phase-3 scope and security notes
 
 - WPA2-Personal with CCMP/AES only (passphrase or raw 32-byte PSK), plus open
@@ -94,7 +106,7 @@ blocking SPIM only; never bridge a C callback to an async future.
   The facade drives FMAC directly; it does not use the scan-only `nrf70-bm`
   public API (only its common board/firmware helper code remains as a pinned
   porting component).
-- One station VIF, 5 GHz scan, link and disconnect events, power save, TX/RX,
+- One station VIF, 2.4 and 5 GHz scans, link and disconnect events, power save, TX/RX,
   statistics, and generation-based reset.
 - Bounded C RX queue (4), small FMAC TX/RX configuration, and application-sized
   Embassy queues.

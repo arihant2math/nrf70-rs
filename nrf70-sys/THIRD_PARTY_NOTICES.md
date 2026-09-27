@@ -16,6 +16,12 @@ Jouni Malinen <j@w1.fi> and contributors. The build verifies that every
 compiled hostap source file carries the per-file BSD license notice. Preserve
 those file headers in source distributions.
 
+The nRF70 coexistence (PTA) tables in `vendor/zephyr_nrf_wifi/` come from the
+Zephyr Project's `drivers/wifi/nrf_wifi` driver and are **Apache-2.0**,
+Copyright (c) 2024-2026 Nordic Semiconductor ASA. `coex_struct.h` is verbatim;
+`coex.c` and `coex.h` are modified, and each file's header states the changes
+as Apache-2.0 §4(b) requires. Preserve those headers in source distributions.
+
 The system-mode firmware at
 `third_party/nrf70-bm/sdk-nrfxlib/nrf_wifi/bin/zephyr/default/nrf70.bin` is
 binary software under Nordic's **LicenseRef-Nordic-5-Clause**, not BSD software.

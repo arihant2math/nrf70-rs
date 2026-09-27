@@ -7,6 +7,7 @@
 #include "system/fmac_rx.h"
 #include "common/fmac_util.h"
 #include "util.h"
+#include "coex.h"
 #include <stdarg.h>
 
 #define TASKLET_SLOTS 16u
@@ -436,6 +437,13 @@ static int fmac_start(const uint8_t mac[6], const uint8_t country[2]) {
         goto fail;
     nrf70_bm_conf_tx_pwr_settings(&power, &ceilings);
     nrf70_bm_conf_board_dep_params(&board);
+    /* Zephyr's defaults: SWCTRL1 is the COEX_STATUS1 input and COEX_GRANT is
+     * active low. The nRF54 PTA client in mcu/src/platform/coex.rs relies on
+     * that polarity. */
+    stage = "init: configuring coex GPIO control";
+    log_msg(1, stage);
+    if (nrf_wifi_coex_config_sleep_ctrl_gpio_ctrl(fmac_dev, 1, 1) != NRF_WIFI_STATUS_SUCCESS)
+        goto fail;
     stage = "init: initializing firmware and RX pools";
     log_msg(1, stage);
     if (nrf_wifi_sys_fmac_dev_init(fmac_dev, HW_SLEEP_ENABLE, NRF_WIFI_DEF_PHY_CALIB,
@@ -774,6 +782,26 @@ int32_t nrf70_facade_key_install(const struct nrf70_facade_key*k){if(!initialize
 int32_t nrf70_facade_key_remove(const struct nrf70_facade_key*k){if(!initialized)return NRF70_FACADE_NOT_INITIALIZED;struct nrf_wifi_umac_key_info i;if(!convert_key(k,&i))return NRF70_FACADE_INVALID;return nrf_wifi_sys_fmac_del_key(rpu_ctx(),vif_idx(),&i,(const char*)k->peer)==NRF_WIFI_STATUS_SUCCESS?0:NRF70_FACADE_IO;}
 int32_t nrf70_facade_controlled_port(uint8_t authorized,const uint8_t peer[6]){if(!initialized)return NRF70_FACADE_NOT_INITIALIZED;if(!peer)return NRF70_FACADE_INVALID;struct nrf_wifi_umac_chg_sta_info i={0};i.sta_flags2.nrf_wifi_mask=NRF_WIFI_STA_FLAG_AUTHORIZED;i.sta_flags2.nrf_wifi_set=authorized?NRF_WIFI_STA_FLAG_AUTHORIZED:0;nrf70_os_memcpy(i.mac_addr,peer,6);return nrf_wifi_sys_fmac_chg_sta(rpu_ctx(),vif_idx(),&i)==NRF_WIFI_STATUS_SUCCESS?0:NRF70_FACADE_IO;}
 int32_t nrf70_facade_set_power_save(uint8_t enabled){if(!initialized)return NRF70_FACADE_NOT_INITIALIZED;return nrf_wifi_sys_fmac_set_power_save(rpu_ctx(),vif_idx(),enabled!=0)==NRF_WIFI_STATUS_SUCCESS?0:NRF70_FACADE_IO;}
+/* Non-PTA registers first, then the PTA table, as sdk-nrf's coex samples do. */
+int32_t nrf70_facade_coex_configure(uint8_t sr_protocol) {
+    if (!initialized) return NRF70_FACADE_NOT_INITIALIZED;
+    if (sr_protocol > NRF70_FACADE_COEX_SR_IEEE802154) return NRF70_FACADE_INVALID;
+    bool ble = sr_protocol == NRF70_FACADE_COEX_SR_BLE;
+    uint32_t s = now_us();
+    int r = nrf70_coex_config_non_pta(rpu_ctx(), ble);
+    if (!r) r = nrf70_coex_config_pta(rpu_ctx(), NRF70_COEX_WLAN_OP_BAND_2_4_GHZ, ble);
+    account_call(s);
+    if (faulted) return NRF70_FACADE_FATAL;
+    return r ? NRF70_FACADE_IO : 0;
+}
+int32_t nrf70_facade_coex_reset(void) {
+    if (!initialized) return NRF70_FACADE_NOT_INITIALIZED;
+    uint32_t s = now_us();
+    int r = nrf70_coex_hw_reset(rpu_ctx());
+    account_call(s);
+    if (faulted) return NRF70_FACADE_FATAL;
+    return r ? NRF70_FACADE_IO : 0;
+}
 int32_t nrf70_facade_tx(uint32_t token, const uint8_t *frame, uint16_t length) {
     if (!initialized) return NRF70_FACADE_NOT_INITIALIZED;
     if (!linked) return NRF70_FACADE_NOT_CONNECTED;

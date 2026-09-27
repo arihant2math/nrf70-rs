@@ -14,6 +14,9 @@ const NRF70_BM_REV: &str = "185ec021afb61dc2d42b4f65800c3aa3d27c88d6";
 const NRF_WIFI_REV: &str = "0aaa9aa812877cb6bc020df8260d0607a3f0ec1a";
 const NRFXLIB_REV: &str = "f1591c62b301c2dc8d91308d43903de563f64d81";
 const HOSTAP_REV: &str = "d467a115b8fc20b8b7120937cb1d445dacebc6a1";
+/// zephyr `drivers/wifi/nrf_wifi/inc/coex_struct.h`, vendored verbatim; the
+/// commit is in vendor-manifest.toml.
+const COEX_STRUCT_SHA256: &str = "de3107a4f32f351ec990be3e6e3c386d8e7ffba99f9eaea4f3cff3d5ca3cf6b5";
 
 const SOURCES: &[&str] = &[
     "nrf70_bm_lib/source/common/nrf70_bm_core.c",
@@ -263,6 +266,18 @@ const PATCHES: &[Patch] = &[
         panic_msg: "pinned event-budget patch no longer applies",
     },
     Patch {
+        // The RPU acknowledges every coex table write with
+        // NRF_WIFI_EVENT_COEX_CONFIG, which the pinned dispatcher rejects as unknown.
+        source: "nrf_wifi/fw_if/umac_if/src/system/fmac_event.c",
+        out_name: "fmac_event_coex_ack.c",
+        edits: &[(
+            "#endif /* NRF70_RAW_DATA_RX || NRF70_PROMISC_DATA_RX */\n\tdefault:",
+            "#endif /* NRF70_RAW_DATA_RX || NRF70_PROMISC_DATA_RX */\n\tcase NRF_WIFI_EVENT_COEX_CONFIG:\n\t\tstatus = NRF_WIFI_STATUS_SUCCESS;\n\t\tbreak;\n\tdefault:",
+        )],
+        marker: "case NRF_WIFI_EVENT_COEX_CONFIG:",
+        panic_msg: "pinned coex-config event patch no longer applies",
+    },
+    Patch {
         source: "nrf_wifi/hw_if/hal/src/common/hal_interrupt.c",
         out_name: "hal_interrupt_bounded.c",
         edits: &[
@@ -349,7 +364,8 @@ fn define_args(firmware: &Path) -> Vec<(String, String)> {
         ("CONFIG_NRF_WIFI_LOW_POWER".into(), "1".into()),
         ("NRF_WIFI_LOW_POWER".into(), "1".into()),
         ("CONFIG_NRF_WIFI_BEAMFORMING".into(), "1".into()),
-        ("CONFIG_NRF_WIFI_OP_BAND".into(), "2".into()),
+        // nrf70_bm_lib's Kconfig numbering: 1 = 2.4 GHz, 2 = 5 GHz, 3 = both.
+        ("CONFIG_NRF_WIFI_OP_BAND".into(), "3".into()),
         ("NRF_WIFI_MAX_PS_POLL_FAIL_CNT".into(), "10".into()),
         // Total RX buffers across all MAX_NUM_OF_RX_QUEUES pools (the HAL
         // sizes its PKTRAM reservation from this); must divide evenly by 3.
@@ -367,6 +383,12 @@ fn define_args(firmware: &Path) -> Vec<(String, String)> {
         ("NRF_WIFI_IFACE_MTU".into(), "1500".into()),
         ("NRF_WIFI_AP_DEAD_DETECT_TIMEOUT".into(), "300".into()),
         ("NRF_WIFI_PS_INT_PS".into(), "1".into()),
+        // Run the RPU's coexistence manager (bt_coex_disable = 0) and compile in
+        // the sleep-control GPIO setup facade.c does after firmware load. The
+        // PTA tables are sent at run time by nrf70_facade_coex_configure.
+        ("NRF70_SR_COEX".into(), "1".into()),
+        ("NRF70_BT_SLOT_TIME".into(), "100".into()),
+        ("NRF70_SR_COEX_SLEEP_CTRL_GPIO_CTRL".into(), "1".into()),
         ("CONFIG_NRF70_REG_DOMAIN".into(), "00".into()),
         ("WIFI_NRF70_LOG_LEVEL".into(), "1".into()),
         (
@@ -397,6 +419,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src/facade_mock.c");
     println!("cargo:rerun-if-changed=src/supplicant.c");
     println!("cargo:rerun-if-changed=src/supplicant.h");
+    println!("cargo:rerun-if-changed=vendor");
     let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     let mock = env::var_os("CARGO_FEATURE_MOCK").is_some();
     let target = env::var("TARGET").unwrap();
@@ -463,6 +486,21 @@ fn main() {
             }
         }
         build.file("src/facade.c");
+        let coex = PathBuf::from("vendor/zephyr_nrf_wifi");
+        if hash(&coex.join("coex_struct.h")) != COEX_STRUCT_SHA256 {
+            panic!("vendored coex_struct.h drifted from upstream");
+        }
+        for name in ["coex_struct.h", "coex.h", "coex.c"] {
+            vendored(
+                &coex,
+                name,
+                "SPDX-License-Identifier: Apache-2.0",
+                "vendored coex source absent",
+                "required Apache-2.0 notice absent",
+            );
+        }
+        build.include(&coex);
+        build.file(coex.join("coex.c"));
         for s in SOURCES {
             let p = vendored(
                 &root,
