@@ -451,7 +451,12 @@ fn main() {
             .output()
             .expect("pinned Clang 21 is required");
         let version = String::from_utf8_lossy(&clang.stdout);
-        if !version.lines().next().unwrap_or("").contains(&format!("{CLANG_MAJOR_VERSION}.")) {
+        if !version
+            .lines()
+            .next()
+            .unwrap_or("")
+            .contains(&format!("{CLANG_MAJOR_VERSION}."))
+        {
             panic!(
                 "Clang {CLANG_MAJOR_VERSION} is pinned, found: {}",
                 version.lines().next().unwrap_or("unknown")

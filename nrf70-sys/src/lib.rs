@@ -32,7 +32,6 @@ pub const CREDENTIAL_PSK: u8 = 2;
 pub const MFP_DISABLED: u8 = 0;
 pub const MFP_OPTIONAL: u8 = 1;
 pub const MFP_REQUIRED: u8 = 2;
-/// `enum nrf70_facade_coex_sr_protocol` values for [`coex_configure`].
 pub const COEX_SR_BLE: u8 = 0;
 pub const COEX_SR_IEEE802154: u8 = 1;
 /// Per entry: compile-time size (and optional `align`) assertion on the bindgen
