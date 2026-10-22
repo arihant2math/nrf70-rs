@@ -8,7 +8,7 @@ publish = false
 
 [features]
 default = []
-defmt = ["dep:defmt"]
+defmt = ["dep:defmt", "heapless/defmt"]
 mock = ["nrf70-sys/mock", "critical-section/std", "embassy-time/std"]
 
 [dependencies]

@@ -35,6 +35,7 @@ pub type EthernetState<const RX: usize, const TX: usize> =
     net_channel::State<ETHERNET_FRAME_SIZE, RX, TX>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Band {
     TwoGhz,
     FiveGhz,
@@ -88,6 +89,7 @@ impl ScanRequest {
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Security {
     Open,
     Wpa2Personal,
@@ -97,6 +99,7 @@ pub enum Security {
     Other,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct AccessPoint {
     pub ssid: Vec<u8, 32>,
     pub band: Band,
@@ -206,6 +209,7 @@ impl Drop for ConnectParams {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Error {
     Busy,
     InvalidCountry,
@@ -255,6 +259,7 @@ pub struct Stats {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum LinkEvent {
     /// The link is usable. For secured sessions this is emitted only after
     /// the 4-way handshake completes and the controlled port is authorized.
@@ -586,7 +591,7 @@ impl Wifi<'_> {
             }
             ssid_seen = true;
             #[cfg(feature = "defmt")]
-            defmt::debug!("connect candidate: {}", defmt::Debug2Format(ap));
+            defmt::debug!("connect candidate: {}", ap);
             if !credential_candidate(ap.security, &request.credential) {
                 continue;
             }
