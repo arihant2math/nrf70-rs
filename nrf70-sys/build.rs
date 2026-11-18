@@ -240,6 +240,262 @@ struct Patch {
 
 const PATCHES: &[Patch] = &[
     Patch {
+        // Validate RX metadata before reads or buffer mutations, and recycle
+        // descriptors even when conversion drops a malformed packet.
+        source: "nrf_wifi/fw_if/umac_if/src/system/rx.c",
+        out_name: "rx_checked.c",
+        edits: &[
+            (
+                r#"static void nrf_wifi_convert_amsdu_to_eth(void *nwb)"#,
+                r#"static enum nrf_wifi_status nrf_wifi_convert_amsdu_to_eth(void *nwb)"#,
+            ),
+            (
+                r#"	amsdu_hdr_len = sizeof(struct nrf_wifi_fmac_amsdu_hdr);
+"#,
+                r#"	amsdu_hdr_len = sizeof(struct nrf_wifi_fmac_amsdu_hdr);
+	/* The EtherType helper reads all eight LLC/SNAP bytes. */
+	if (nrf_wifi_osal_nbuf_data_size(nwb) < amsdu_hdr_len + 8U) {
+		return NRF_WIFI_STATUS_FAIL;
+	}
+"#,
+            ),
+            (
+                r#"	nrf_wifi_osal_nbuf_data_pull(nwb,
+					 (amsdu_hdr_len +
+					  nrf_wifi_get_skip_header_bytes(eth_type)));"#,
+                r#"	if (!nrf_wifi_osal_nbuf_data_pull(nwb, amsdu_hdr_len +
+					 nrf_wifi_get_skip_header_bytes(eth_type))) {
+		return NRF_WIFI_STATUS_FAIL;
+	}"#,
+            ),
+            (
+                r#"	nrf_wifi_osal_mem_cpy(ehdr->src,
+				  amsdu_hdr.src,"#,
+                r#"	if (!ehdr) {
+		return NRF_WIFI_STATUS_FAIL;
+	}
+
+	nrf_wifi_osal_mem_cpy(ehdr->src,
+				  amsdu_hdr.src,"#,
+            ),
+            (
+                r#"		ehdr->proto = len;
+	}
+}
+
+static void nrf_wifi_convert_to_eth"#,
+                r#"		ehdr->proto = len;
+	}
+	return NRF_WIFI_STATUS_SUCCESS;
+}
+
+static enum nrf_wifi_status nrf_wifi_convert_to_eth"#,
+            ),
+            (
+                r#"	switch (hdr->fc & (NRF_WIFI_FCTL_TODS | NRF_WIFI_FCTL_FROMDS)) {"#,
+                r#"	if (!ehdr) {
+		return NRF_WIFI_STATUS_FAIL;
+	}
+
+	switch (hdr->fc & (NRF_WIFI_FCTL_TODS | NRF_WIFI_FCTL_FROMDS)) {"#,
+            ),
+            (
+                r#"		ehdr->proto = len;
+	}
+}
+#endif /* NRF70_STA_MODE */"#,
+                r#"		ehdr->proto = len;
+	}
+	return NRF_WIFI_STATUS_SUCCESS;
+}
+#endif /* NRF70_STA_MODE */"#,
+            ),
+            (
+                r#"	unsigned int pkt_len = 0;"#,
+                r#"	unsigned int pkt_len = 0;
+	bool drop;
+	enum nrf_wifi_status result = NRF_WIFI_STATUS_SUCCESS;"#,
+            ),
+            (
+                r#"	vif_ctx = sys_dev_ctx->vif_ctx[config->wdev_id];"#,
+                r#"	if (config->umac_head.len < sizeof(*config) ||
+	    config->rx_pkt_cnt > (config->umac_head.len - sizeof(*config)) /
+				 sizeof(config->rx_buff_info[0])) {
+		return NRF_WIFI_STATUS_FAIL;
+	}
+	if (config->wdev_id < MAX_NUM_VIFS) {
+		vif_ctx = sys_dev_ctx->vif_ctx[config->wdev_id];
+	}"#,
+            ),
+            (
+                r#"	if (config->rx_pkt_type != NRF_WIFI_RAW_RX_PKT) {"#,
+                r#"	if (vif_ctx && config->rx_pkt_type != NRF_WIFI_RAW_RX_PKT) {"#,
+            ),
+            (
+                r#"		nwb_data = (void *)nrf_wifi_sys_hal_buf_unmap_rx(fmac_dev_ctx->hal_dev_ctx,
+								 pkt_len,"#,
+                r#"		rx_buf_info = &sys_dev_ctx->rx_buf_info[desc_id];
+		if (!rx_buf_info->mapped || !rx_buf_info->nwb) {
+			result = NRF_WIFI_STATUS_FAIL;
+			continue;
+		}
+		/* Reject before HAL copies from packet RAM into the host allocation. */
+		drop = !pkt_len || pkt_len > sys_fpriv->rx_buf_pools[pool_info.pool_id].buf_sz;
+		nwb_data = (void *)nrf_wifi_sys_hal_buf_unmap_rx(fmac_dev_ctx->hal_dev_ctx,
+								 drop ? 0 : pkt_len,"#,
+            ),
+            (
+                r#"		rx_buf_info = &sys_dev_ctx->rx_buf_info[desc_id];
+		nwb = (void *)rx_buf_info->nwb;
+
+		/**
+		 * For nRF71 the RX_BUF_HEADROOM does not seem to be needed.
+		 * Remove the same. What parameters does RX_BUF_HEADROOM have??
+		 */
+		nrf_wifi_osal_nbuf_data_put(nwb,
+						pkt_len + RX_BUF_HEADROOM);
+		nrf_wifi_osal_nbuf_data_pull(nwb,
+						 RX_BUF_HEADROOM);
+		nwb_data = nrf_wifi_osal_nbuf_data_get(nwb);
+		rx_buf_info->nwb = 0;
+		rx_buf_info->mapped = false;"#,
+                r#"		nwb = (void *)rx_buf_info->nwb;
+		rx_buf_info->nwb = 0;
+		rx_buf_info->mapped = false;
+		if (drop || !vif_ctx ||
+		    !nrf_wifi_osal_nbuf_data_put(nwb, pkt_len + RX_BUF_HEADROOM) ||
+		    !nrf_wifi_osal_nbuf_data_pull(nwb, RX_BUF_HEADROOM)) {
+			goto drop_packet;
+		}
+		nwb_data = nrf_wifi_osal_nbuf_data_get(nwb);"#,
+            ),
+            (
+                r#"			case PKT_TYPE_MPDU:
+				nrf_wifi_osal_mem_cpy(&hdr,
+							  nwb_data,
+							  sizeof(struct nrf_wifi_fmac_ieee80211_hdr));"#,
+                r#"			case PKT_TYPE_MPDU:
+				/* Three addresses need 24 bytes; addr_4 only exists for WDS. */
+				if (config->mac_header_len < 24 ||
+				    config->mac_header_len > pkt_len ||
+				    pkt_len - config->mac_header_len < 8) {
+					goto drop_packet;
+				}
+				nrf_wifi_osal_mem_set(&hdr, 0, sizeof(hdr));
+				nrf_wifi_osal_mem_cpy(&hdr, nwb_data, 24);
+				if ((hdr.fc & (NRF_WIFI_FCTL_TODS | NRF_WIFI_FCTL_FROMDS)) ==
+				    (NRF_WIFI_FCTL_TODS | NRF_WIFI_FCTL_FROMDS)) {
+					if (config->mac_header_len < sizeof(hdr)) {
+						goto drop_packet;
+					}
+					nrf_wifi_osal_mem_cpy(hdr.addr_4, (char *)nwb_data + 24,
+							  sizeof(hdr.addr_4));
+				}"#,
+            ),
+            (
+                r#"				nrf_wifi_osal_nbuf_data_pull(nwb,
+								 size);
+
+				nrf_wifi_convert_to_eth(nwb,
+							&hdr,
+							eth_type);"#,
+                r#"				if (!nrf_wifi_osal_nbuf_data_pull(nwb, size) ||
+				    nrf_wifi_convert_to_eth(nwb, &hdr, eth_type) !=
+							NRF_WIFI_STATUS_SUCCESS) {
+					goto drop_packet;
+				}"#,
+            ),
+            (
+                r#"				nrf_wifi_osal_nbuf_data_pull(nwb,
+								 config->mac_header_len);
+
+				nrf_wifi_convert_amsdu_to_eth(nwb);
+				break;
+			case PKT_TYPE_MSDU:
+				nrf_wifi_convert_amsdu_to_eth(nwb);"#,
+                r#"				if (config->mac_header_len < 24 ||
+				    !nrf_wifi_osal_nbuf_data_pull(nwb, config->mac_header_len)) {
+					goto drop_packet;
+				}
+				/* fall through */
+			case PKT_TYPE_MSDU:
+				if (nrf_wifi_convert_amsdu_to_eth(nwb) != NRF_WIFI_STATUS_SUCCESS) {
+					goto drop_packet;
+				}"#,
+            ),
+            (
+                r#"							  (config->rx_buff_info[i].pkt_type));
+				status = NRF_WIFI_STATUS_FAIL;
+				continue;"#,
+                r#"							  (config->rx_buff_info[i].pkt_type));
+				goto drop_packet;"#,
+            ),
+            (
+                r#"			status = NRF_WIFI_STATUS_FAIL;
+			nrf_wifi_osal_nbuf_free(nwb);
+			continue;
+		}
+
+		status = nrf_wifi_fmac_rx_cmd_send"#,
+                r#"			goto drop_packet;
+		}
+		goto refill;
+drop_packet:
+		result = NRF_WIFI_STATUS_FAIL;
+		nrf_wifi_osal_nbuf_free(nwb);
+refill:
+		status = nrf_wifi_fmac_rx_cmd_send"#,
+            ),
+            (
+                r#"						  desc_id);
+			status = NRF_WIFI_STATUS_FAIL;
+			continue;"#,
+                r#"						  desc_id);
+			result = NRF_WIFI_STATUS_FAIL;
+			continue;"#,
+            ),
+            (
+                r#"			status = NRF_WIFI_STATUS_FAIL;
+			continue;
+		}
+		rx_buf_info = &sys_dev_ctx->rx_buf_info[desc_id];"#,
+                r#"			result = NRF_WIFI_STATUS_FAIL;
+			continue;
+		}
+		rx_buf_info = &sys_dev_ctx->rx_buf_info[desc_id];"#,
+            ),
+            (
+                r#"			status = NRF_WIFI_STATUS_FAIL;
+			continue;
+		}
+		nwb = (void *)rx_buf_info->nwb;"#,
+                r#"			result = NRF_WIFI_STATUS_FAIL;
+			continue;
+		}
+		nwb = (void *)rx_buf_info->nwb;"#,
+            ),
+            (
+                r#"			nrf_wifi_osal_log_err("%s: nrf_wifi_fmac_rx_cmd_send failed",
+						  __func__);
+			continue;"#,
+                r#"			nrf_wifi_osal_log_err("%s: nrf_wifi_fmac_rx_cmd_send failed",
+						  __func__);
+			result = NRF_WIFI_STATUS_FAIL;
+			continue;"#,
+            ),
+            (
+                r#"#endif /*NRF_WIFI_RX_BUFF_PROG_UMAC */
+	return status;
+}"#,
+                r#"#endif /*NRF_WIFI_RX_BUFF_PROG_UMAC */
+	return result == NRF_WIFI_STATUS_FAIL ? result : status;
+}"#,
+            ),
+        ],
+        marker: "drop_packet:",
+        panic_msg: "pinned RX validation patch no longer applies",
+    },
+    Patch {
         source: "nrf_wifi/fw_if/umac_if/src/system/fmac_api.c",
         out_name: "fmac_api_open_bssid.c",
         edits: &[(
