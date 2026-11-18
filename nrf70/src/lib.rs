@@ -9,7 +9,7 @@ pub use platform::{Bus, Platform};
 pub use spi::{BoardControl, SpiTransport};
 
 use core::cell::RefCell;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI8, AtomicU32, Ordering};
 use embassy_net_driver_channel::{
     self as net_channel,
     driver::{HardwareAddress, LinkState},
@@ -31,6 +31,7 @@ pub const OPEN_CONNECT_TIMEOUT_US: u32 = 10_000_000;
 /// the 4-way handshake, so they get a longer budget than open connects.
 pub const SECURE_CONNECT_TIMEOUT_US: u32 = 30_000_000;
 const EAPOL_ETHERTYPE: [u8; 2] = [0x88, 0x8e];
+const RSSI_UNKNOWN: i8 = i8::MIN;
 pub type EthernetState<const RX: usize, const TX: usize> =
     net_channel::State<ETHERNET_FRAME_SIZE, RX, TX>;
 
@@ -334,6 +335,7 @@ pub struct Resources {
     events: Channel<CriticalSectionRawMutex, LinkEvent, 8>,
     irq: Signal<CriticalSectionRawMutex, ()>,
     wake: Signal<CriticalSectionRawMutex, ()>,
+    rssi: AtomicI8,
     cancel_id: AtomicU32,
     next_id: AtomicU32,
     busy: AtomicBool,
@@ -351,6 +353,7 @@ impl Resources {
             events: Channel::new(),
             irq: Signal::new(),
             wake: Signal::new(),
+            rssi: AtomicI8::new(RSSI_UNKNOWN),
             cancel_id: AtomicU32::new(0),
             next_id: AtomicU32::new(1),
             busy: AtomicBool::new(false),
@@ -715,6 +718,12 @@ impl Wifi<'_> {
     }
     pub async fn next_link_event(&self) -> LinkEvent {
         self.r.events.receive().await
+    }
+    /// RSSI of the last frame received from the AP, in dBm; `None` while the
+    /// link is down or before the first frame arrives.
+    pub fn rssi(&self) -> Option<i8> {
+        let rssi = self.r.rssi.load(Ordering::Relaxed);
+        (rssi != RSSI_UNKNOWN).then_some(rssi)
     }
 }
 
@@ -1175,6 +1184,9 @@ impl<B: Bus + Send + 'static, const N: usize> Runner<'_, B, N> {
             return;
         }
         self.linked = up;
+        if !up {
+            self.r.rssi.store(RSSI_UNKNOWN, Ordering::Relaxed)
+        }
         if let Some(net) = &mut self.net {
             net.set_link_state(if up { LinkState::Up } else { LinkState::Down })
         }
@@ -1212,6 +1224,9 @@ impl<B: Bus + Send + 'static, const N: usize> Runner<'_, B, N> {
             match unsafe { nrf70_sys::rx_pop(&mut frame) } {
                 Ok(Some(meta)) => {
                     let n = meta.length as usize;
+                    if self.linked {
+                        self.r.rssi.store(meta.rssi_dbm, Ordering::Relaxed)
+                    }
                     if !(14..=ETHERNET_FRAME_SIZE).contains(&n) {
                         continue;
                     }
