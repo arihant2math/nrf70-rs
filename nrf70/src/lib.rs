@@ -490,7 +490,7 @@ impl Wifi<'_> {
         let id = self
             .r
             .next_id
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |id| id.checked_add(1))
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |id| id.checked_add(1))
             .map_err(|_| {
                 self.r.busy.store(false, Ordering::Release);
                 Error::Fatal
