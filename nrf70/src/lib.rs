@@ -544,7 +544,6 @@ impl Wifi<'_> {
             .channels
             .iter()
             .any(|(band, channel)| band.frequency_mhz(*channel).is_none())
-            || request.ssid_filter.len() >= 32
         {
             return Err(Error::InvalidRequest);
         }
