@@ -190,13 +190,17 @@ static void fatal(int32_t reason, const char *msg) {
     enqueue_event(&e, 1);
 }
 
+/* Non-fatal arena allocation for callers that can drop work on exhaustion. */
+static void *try_alloc(size_t n, uint8_t zeroed) {
+    void *p = platform && platform->alloc
+                  ? platform->alloc(platform->context, (uint32_t)n, 8, zeroed)
+                  : 0;
+    if (!p) counters.allocation_failures++;
+    return p;
+}
 void *nrf70_os_malloc(size_t n) {
-    void *p =
-        platform && platform->alloc ? platform->alloc(platform->context, (uint32_t)n, 8, 0) : 0;
-    if (!p) {
-        counters.allocation_failures++;
-        fatal(NRF70_FACADE_NO_MEMORY, "Wi-Fi control arena exhausted");
-    }
+    void *p = try_alloc(n, 0);
+    if (!p) fatal(NRF70_FACADE_NO_MEMORY, "Wi-Fi control arena exhausted");
     return p;
 }
 void *nrf70_os_calloc(size_t count, size_t n) {
@@ -205,13 +209,8 @@ void *nrf70_os_calloc(size_t count, size_t n) {
         fatal(NRF70_FACADE_NO_MEMORY, "Wi-Fi allocation overflow");
         return 0;
     }
-    size_t total = count * n;
-    void *p =
-        platform && platform->alloc ? platform->alloc(platform->context, (uint32_t)total, 8, 1) : 0;
-    if (!p) {
-        counters.allocation_failures++;
-        fatal(NRF70_FACADE_NO_MEMORY, "Wi-Fi control arena exhausted");
-    }
+    void *p = try_alloc(count * n, 1);
+    if (!p) fatal(NRF70_FACADE_NO_MEMORY, "Wi-Fi control arena exhausted");
     return p;
 }
 void nrf70_os_free(void *p) {
@@ -492,10 +491,11 @@ static unsigned int list_len(void *l) {
     return l ? ((struct list *)l)->len : 0;
 }
 
-static void *nbuf_alloc(unsigned int size) {
-    struct nbuf *n = mem_zalloc(sizeof(*n));
+/* Host TX buffers: exhaustion drops the frame instead of faulting the driver. */
+static struct nbuf *nbuf_try_alloc(unsigned int size) {
+    struct nbuf *n = try_alloc(sizeof(*n), 1);
     if (!n) return 0;
-    n->base = mem_alloc(size);
+    n->base = try_alloc(size, 0);
     if (!n->base) {
         mem_free(n);
         return 0;
@@ -505,6 +505,13 @@ static void *nbuf_alloc(unsigned int size) {
     counters.nbuf_in_use++;
     if (counters.nbuf_in_use > counters.nbuf_high_water)
         counters.nbuf_high_water = counters.nbuf_in_use;
+    return n;
+}
+/* FMAC's only caller is RX refill, which permanently loses the descriptor on
+ * failure, so exhaustion there still faults the driver. */
+static void *nbuf_alloc(unsigned int size) {
+    struct nbuf *n = nbuf_try_alloc(size);
+    if (!n) fatal(NRF70_FACADE_NO_MEMORY, "Wi-Fi RX buffer arena exhausted");
     return n;
 }
 /* TX_COMPLETE describes host-buffer release, not an over-the-air ACK. FMAC
@@ -1709,7 +1716,7 @@ int32_t nrf70_supp_host_ether_send(const uint8_t dst[6], uint16_t proto, const u
         counters.eapol_tx_failed++;
         return NRF70_FACADE_INVALID;
     }
-    struct nbuf *n = nbuf_alloc((unsigned int)len + 14u + TX_HEADROOM);
+    struct nbuf *n = nbuf_try_alloc((unsigned int)len + 14u + TX_HEADROOM);
     if (!n) {
         counters.eapol_tx_failed++;
         return NRF70_FACADE_NO_MEMORY;
@@ -2148,7 +2155,7 @@ int32_t nrf70_facade_tx(uint32_t token, const uint8_t *frame, uint16_t length) {
     if (conn.secured && conn.state != CONN_IDLE && conn.state != CONN_AUTHORIZED)
         return NRF70_FACADE_NOT_CONNECTED;
     if (!frame || length < 14 || length > NRF70_FACADE_MAX_FRAME_LEN) return NRF70_FACADE_INVALID;
-    struct nbuf *n = nbuf_alloc((unsigned int)length + TX_HEADROOM);
+    struct nbuf *n = nbuf_try_alloc((unsigned int)length + TX_HEADROOM);
     if (!n) return NRF70_FACADE_NO_MEMORY;
     nbuf_res(n, TX_HEADROOM);
     void *d = nbuf_put(n, length);
