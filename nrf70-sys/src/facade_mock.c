@@ -127,6 +127,7 @@ uint32_t nrf70_facade_process(uint32_t budget){
     }
     return v;
 }
+uint32_t nrf70_facade_next_deadline_us(void){return count||(initialized&&(irq||pending_authorize))?0:NRF70_FACADE_NO_DEADLINE;}
 int32_t nrf70_facade_event_pop(struct nrf70_facade_event *e){if(!e)return NRF70_FACADE_INVALID;if(!count)return 0;*e=queue[head];head=(head+1)%MOCK_EVENTS;count--;return 1;}
 void nrf70_facade_stats_get(struct nrf70_facade_stats *s){if(s)*s=stats;}
 uint8_t nrf70_facade_host_irq_active(void){return ops.host_irq_active?ops.host_irq_active(ops.context):0;}

@@ -1732,6 +1732,30 @@ void nrf70_supp_host_completed(uint8_t rekey) {
     enqueue_event(&e, 1);
 }
 
+/* Whether conn_step() would act now rather than wait for an FMAC callback.
+ * Must mirror conn_step(): a state that reports ready here but makes no
+ * progress there would spin the driver task. */
+static uint8_t conn_ready(void) {
+    if (conn.teardown) return 1;
+    switch (conn.state) {
+    case CONN_DERIVE:
+    case CONN_SCAN_START:
+    case CONN_AUTH_START:
+    case CONN_SUPP_SETUP:
+        return 1;
+    case CONN_SCAN_WAIT:
+        return conn.scan_fetch || conn.scan_done;
+    case CONN_AUTH_WAIT:
+        return conn.auth_fail || conn.auth_ok;
+    case CONN_ASSOC_WAIT:
+        return conn.assoc_fail || conn.assoc_ok;
+    case CONN_HANDSHAKE:
+    case CONN_AUTHORIZED:
+        return eapol_count != 0;
+    default:
+        return 0;
+    }
+}
 /* Runs at most one bounded action; returns 1 when work was done. */
 static uint32_t conn_step(void) {
     if (conn_stepping) return 0;
@@ -2166,6 +2190,25 @@ uint32_t nrf70_facade_process(uint32_t budget) {
         if (!did) break;
     }
     return ran;
+}
+/* Must name every source nrf70_facade_process() services; one missed here is
+ * only serviced on the next unrelated wakeup. */
+uint32_t nrf70_facade_next_deadline_us(void) {
+    if (event_count) return 0;
+    /* A faulted facade runs nothing until the reset/deinit that follows. */
+    if (!initialized || faulted) return NRF70_FACADE_NO_DEADLINE;
+    if ((irq_pending && irq_callback) || scan_fetch_pending || conn_ready()) return 0;
+    for (unsigned i = 0; i < TASKLET_SLOTS; i++)
+        if (tasklets[i].used && tasklets[i].pending) return 0;
+    uint32_t n = now_us(), next = NRF70_FACADE_NO_DEADLINE;
+    if (nrf70_supp_active()) next = nrf70_supp_eloop_next_us(n);
+    for (unsigned i = 0; i < TIMER_SLOTS; i++) {
+        if (!timers[i].used || !timers[i].armed) continue;
+        int32_t left = (int32_t)(timers[i].deadline - n);
+        if (left <= 0) return 0;
+        if ((uint32_t)left < next) next = (uint32_t)left;
+    }
+    return next;
 }
 int32_t nrf70_facade_event_pop(struct nrf70_facade_event *e) {
     if (!e) return NRF70_FACADE_INVALID;

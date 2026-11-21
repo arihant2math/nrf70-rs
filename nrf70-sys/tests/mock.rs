@@ -189,11 +189,20 @@ fn phase3_facade_connect_flows() {
         unsafe { nrf70_sys::tx(9, &frame) },
         Err(nrf70_sys::Status::NotConnected)
     );
+    // Deferred work and queued events both ask for an immediate pass; with
+    // neither, only HOST_IRQ or a new call can create work.
+    assert_eq!(unsafe { nrf70_sys::next_deadline_us() }, Some(0));
     unsafe { nrf70_sys::process(8) };
+    assert_eq!(unsafe { nrf70_sys::next_deadline_us() }, Some(0));
     assert!(matches!(
         unsafe { nrf70_sys::event_pop() },
         Some(nrf70_sys::Event::PortAuthorized { .. })
     ));
+    assert_eq!(unsafe { nrf70_sys::next_deadline_us() }, None);
+    unsafe { nrf70_sys::notify_host_irq() };
+    assert_eq!(unsafe { nrf70_sys::next_deadline_us() }, Some(0));
+    unsafe { nrf70_sys::process(8) };
+    assert_eq!(unsafe { nrf70_sys::next_deadline_us() }, None);
     // The port is authorized: data TX now succeeds.
     unsafe { nrf70_sys::tx(10, &frame).unwrap() };
     drain();

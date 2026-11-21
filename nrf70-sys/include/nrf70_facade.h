@@ -16,6 +16,8 @@ extern "C" {
 #define NRF70_FACADE_MAX_KEY_LEN 64u
 #define NRF70_FACADE_MAX_SEQ_LEN 16u
 #define NRF70_FACADE_MAX_CREDENTIAL_LEN 64u
+/* nrf70_facade_next_deadline_us: nothing is scheduled. */
+#define NRF70_FACADE_NO_DEADLINE 0xFFFFFFFFu
 
 /* Fixed values: these are part of the Rust/C ABI. */
 enum nrf70_facade_status {
@@ -264,6 +266,14 @@ int32_t nrf70_facade_rx_pop(uint8_t *frame, uint16_t capacity,
 void nrf70_facade_notify_host_irq(void);
 /* Runs at most budget deferred callbacks. Returns the number run. */
 uint32_t nrf70_facade_process(uint32_t budget);
+/* Microseconds until the driver task must next call nrf70_facade_process or
+ * nrf70_facade_event_pop: 0 when deferred work or a queued event is already
+ * waiting, NRF70_FACADE_NO_DEADLINE when only HOST_IRQ or another facade call
+ * can create work. Covers the IRQ continuation, pending result fetches, the
+ * connect state machine, tasklets, OSAL timers and the supplicant event loop.
+ * Queued RX frames are not counted: the caller drains them with
+ * nrf70_facade_rx_pop. Relative, so it is unaffected by now_us wrapping. */
+uint32_t nrf70_facade_next_deadline_us(void);
 int32_t nrf70_facade_event_pop(struct nrf70_facade_event *event);
 void nrf70_facade_stats_get(struct nrf70_facade_stats *stats);
 uint8_t nrf70_facade_host_irq_active(void);

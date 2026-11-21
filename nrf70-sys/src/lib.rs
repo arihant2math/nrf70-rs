@@ -574,6 +574,16 @@ pub unsafe fn notify_host_irq() {
 pub unsafe fn process(budget: u32) -> u32 {
     unsafe { raw::nrf70_facade_process(budget) }
 }
+/// Microseconds until the facade next needs [`process`] or [`event_pop`]:
+/// `Some(0)` when work is already waiting, `None` when only HOST_IRQ or
+/// another call into this crate can create some.
+/// # Safety Call only from the serialized runner.
+pub unsafe fn next_deadline_us() -> Option<u32> {
+    match unsafe { raw::nrf70_facade_next_deadline_us() } {
+        raw::NRF70_FACADE_NO_DEADLINE => None,
+        us => Some(us),
+    }
+}
 /// # Safety Call only while the installed platform is alive.
 pub unsafe fn host_irq_active() -> bool {
     let active = unsafe { raw::nrf70_facade_host_irq_active() };

@@ -42,6 +42,9 @@ void nrf70_supp_notify_assoc(const uint8_t bssid[6]);
 void nrf70_supp_rx_eapol(const uint8_t src[6], const uint8_t *frame, uint16_t len);
 /* Runs expired mini-eloop timeouts. Returns the number of handlers run. */
 uint32_t nrf70_supp_eloop_poll(uint32_t now_us);
+/* Microseconds until the earliest mini-eloop timeout: 0 if one has expired,
+ * UINT32_MAX if none is registered. */
+uint32_t nrf70_supp_eloop_next_us(uint32_t now_us);
 /* wpa_sm_deinit (zeroizes the PMK/PTK inside wpa_sm) + clears all staging. */
 void nrf70_supp_stop(void);
 /* Zeroizes only the static secret staging (PBKDF2 state). Safe to call from

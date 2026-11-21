@@ -183,6 +183,17 @@ uint32_t nrf70_supp_eloop_poll(uint32_t now_us) {
     }
     return ran;
 }
+uint32_t nrf70_supp_eloop_next_us(uint32_t now_us) {
+    uint32_t next = UINT32_MAX;
+    for (unsigned i = 0; i < SUPP_ELOOP_SLOTS; i++) {
+        struct supp_timeout *t = &supp_timeouts[i];
+        if (!t->used) continue;
+        int32_t left = (int32_t)(t->deadline_us - now_us);
+        if (left <= 0) return 0;
+        if ((uint32_t)left < next) next = (uint32_t)left;
+    }
+    return next;
+}
 
 /* Sliced PBKDF2-SHA1 (RFC 2898): 4096 iterations, two 20-byte blocks for the
  * 32-byte PMK. hostap's one-shot pbkdf2_sha1 would block for tens of ms. */

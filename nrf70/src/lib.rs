@@ -9,7 +9,10 @@ pub use platform::{Bus, Platform};
 pub use spi::{BoardControl, SpiTransport};
 
 use core::cell::RefCell;
+use core::future::{Future, poll_fn};
+use core::pin::{Pin, pin};
 use core::sync::atomic::{AtomicBool, AtomicI8, AtomicU32, Ordering};
+use core::task::Poll;
 use embassy_net_driver_channel::{
     self as net_channel,
     driver::{HardwareAddress, LinkState},
@@ -30,6 +33,9 @@ pub const OPEN_CONNECT_TIMEOUT_US: u32 = 10_000_000;
 /// Secured sessions cover PMK derivation, the connect scan, auth/assoc, and
 /// the 4-way handshake, so they get a longer budget than open connects.
 pub const SECURE_CONNECT_TIMEOUT_US: u32 = 30_000_000;
+/// Retry interval for the two conditions no event announces: FMAC refusing a
+/// frame for lack of TX room, and HOST_IRQ still asserted after a full pass.
+const RETRY_POLL_US: u32 = 1_000;
 const EAPOL_ETHERTYPE: [u8; 2] = [0x88, 0x8e];
 const RSSI_UNKNOWN: i8 = i8::MIN;
 pub type EthernetState<const RX: usize, const TX: usize> =
@@ -376,6 +382,9 @@ pub struct HostIrq<'a> {
 }
 impl HostIrq<'_> {
     /// Call from the GPIO ISR. It only signals thread mode and never invokes C or SPI.
+    ///
+    /// The runner sleeps until this fires, so every HOST_IRQ assertion must
+    /// reach it; an assertion that is missed stalls RX and command responses.
     pub fn on_interrupt(&self) {
         self.resources.irq.signal(())
     }
@@ -727,13 +736,15 @@ impl Wifi<'_> {
 }
 
 impl<B: Bus + Send + 'static, const N: usize> Runner<'_, B, N> {
+    /// Each pass does a bounded amount of work, then sleeps until HOST_IRQ, a
+    /// command or cancellation, the network stack, or the next deadline needs
+    /// another one.
     pub async fn run(mut self) -> ! {
         loop {
             self.handle_cancel();
             if let Ok(cmd) = self.r.commands.try_receive() {
                 self.command(cmd)
             }
-            let _ = self.r.wake.try_take();
             if self.r.irq.try_take().is_some() {
                 unsafe { nrf70_sys::notify_host_irq() }
             }
@@ -743,10 +754,70 @@ impl<B: Bus + Send + 'static, const N: usize> Runner<'_, B, N> {
             let _ = unsafe { nrf70_sys::process(EVENT_DRAIN_BUDGET) };
             self.drain_events();
             self.check_connect_timeout();
-            self.pump_rx();
-            self.pump_tx();
-            Timer::after(Duration::from_millis(1)).await;
+            let rx_blocked = self.pump_rx();
+            let tx_blocked = self.pump_tx();
+            match self.sleep_budget_us(tx_blocked) {
+                Some(0) => yield_now().await,
+                budget => {
+                    let watch_tx = self.tx_open() && !tx_blocked;
+                    self.sleep(budget, rx_blocked, watch_tx).await
+                }
+            }
         }
+    }
+    /// How long the runner may sleep if nothing wakes it: `Some(0)` to run
+    /// another pass at once, `None` for no time limit.
+    fn sleep_budget_us(&self, tx_blocked: bool) -> Option<u32> {
+        let mut budget = unsafe { nrf70_sys::next_deadline_us() };
+        let mut limit = |us: u32| budget = Some(budget.map_or(us, |b| b.min(us)));
+        if self.connect_id.is_some() {
+            let left = self.connect_deadline.wrapping_sub(self.platform_time()) as i32;
+            limit(left.max(0) as u32)
+        }
+        // The edge that would announce a still-asserted HOST_IRQ has already
+        // been consumed, so sample the level again rather than wait for it.
+        if tx_blocked || (self.initialized && unsafe { nrf70_sys::host_irq_active() }) {
+            limit(RETRY_POLL_US)
+        }
+        budget
+    }
+    /// Whether data frames may be transmitted: the link is up and, on a
+    /// secured session, the handshake has authorized the controlled port.
+    fn tx_open(&self) -> bool {
+        self.linked && (!self.secured || self.port_authorized)
+    }
+    /// Sleeps until any wake source fires. The sources are only observed here;
+    /// the next pass consumes them. `watch_rx`/`watch_tx` add the network
+    /// stack freeing an RX buffer and queueing a TX frame.
+    async fn sleep(&mut self, budget_us: Option<u32>, watch_rx: bool, watch_tx: bool) {
+        let r = self.r;
+        let net = &mut self.net;
+        let mut irq = pin!(r.irq.wait());
+        let mut wake = pin!(r.wake.wait());
+        let mut timer = budget_us.map(|us| Timer::after(Duration::from_micros(us.into())));
+        poll_fn(|cx| {
+            let mut ready = false;
+            if irq.as_mut().poll(cx).is_ready() {
+                // Waiting took the signal, so hand it to C here.
+                unsafe { nrf70_sys::notify_host_irq() }
+                ready = true
+            }
+            ready |= wake.as_mut().poll(cx).is_ready();
+            ready |= r.commands.poll_ready_to_receive(cx).is_ready();
+            if let Some(timer) = &mut timer {
+                ready |= Pin::new(timer).poll(cx).is_ready()
+            }
+            if let Some(net) = net {
+                ready |= watch_rx && net.poll_rx_buf(cx).is_ready();
+                ready |= watch_tx && net.poll_tx_buf(cx).is_ready()
+            }
+            if ready {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await
     }
     fn emit(&self, e: LinkEvent) {
         if self.r.events.try_send(e).is_err() {
@@ -1215,10 +1286,16 @@ impl<B: Bus + Send + 'static, const N: usize> Runner<'_, B, N> {
             })
         }
     }
-    fn pump_rx(&mut self) {
-        let Some(net) = &mut self.net else { return };
+    /// Returns whether the network stack has no free RX buffer, in which case
+    /// received frames may still be queued in C.
+    fn pump_rx(&mut self) -> bool {
+        let Some(net) = &mut self.net else {
+            return false;
+        };
         loop {
-            let Some(dst) = net.try_rx_buf() else { return };
+            let Some(dst) = net.try_rx_buf() else {
+                return true;
+            };
             let mut frame = [0u8; ETHERNET_FRAME_SIZE];
             match unsafe { nrf70_sys::rx_pop(&mut frame) } {
                 Ok(Some(meta)) => {
@@ -1237,30 +1314,36 @@ impl<B: Bus + Send + 'static, const N: usize> Runner<'_, B, N> {
                     dst[..n].copy_from_slice(&frame[..n]);
                     net.rx_done(n)
                 }
-                Ok(None) => return,
-                Err(_) => return,
+                Ok(None) => return false,
+                Err(_) => return false,
             }
         }
     }
-    fn pump_tx(&mut self) {
+    /// Sends at most one frame. Returns whether FMAC had no room for it, in
+    /// which case it stays queued for a later pass.
+    fn pump_tx(&mut self) -> bool {
         // Second gate against transmitting data frames during the handshake.
-        if !self.linked || (self.secured && !self.port_authorized) {
-            return;
+        if !self.tx_open() {
+            return false;
         }
-        let Some(net) = &mut self.net else { return };
+        let Some(net) = &mut self.net else {
+            return false;
+        };
         let Some(frame) = net.try_tx_buf() else {
-            return;
+            return false;
         };
         let token = self.next_tx_token;
         match unsafe { nrf70_sys::tx(token, frame) } {
             Ok(()) => {
                 self.next_tx_token = self.next_tx_token.wrapping_add(1).max(1);
-                net.tx_done()
+                net.tx_done();
+                false
             }
-            Err(nrf70_sys::Status::QueueFull) => {}
+            Err(nrf70_sys::Status::QueueFull) => true,
             Err(_) => {
                 self.r.tx_drops.fetch_add(1, Ordering::Relaxed);
-                net.tx_done()
+                net.tx_done();
+                false
             }
         }
     }
@@ -1308,6 +1391,19 @@ impl<B: Bus + Send + 'static, const N: usize> Runner<'_, B, N> {
             self.set_link(false, 0, 0)
         }
     }
+}
+/// Lets other tasks run before the next pass.
+async fn yield_now() {
+    let mut yielded = false;
+    poll_fn(|cx| {
+        if core::mem::replace(&mut yielded, true) {
+            Poll::Ready(())
+        } else {
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    })
+    .await
 }
 // This is only a display-scan prefilter. A WPA3 label may include WPA2 PSK
 // transition mode; the C connect scan validates the actual RSN AKMs/ciphers.
