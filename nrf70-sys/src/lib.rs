@@ -58,6 +58,7 @@ abi_checks! {
     nrf70_facade_connect_request, 110, nrf70_facade_sizeof_connect_request, align 2;
     nrf70_facade_key, 96, nrf70_facade_sizeof_key;
     nrf70_facade_event, 64, nrf70_facade_sizeof_event;
+    nrf70_facade_link_info, 48, nrf70_facade_sizeof_link_info;
     nrf70_facade_rx_meta, 12, nrf70_facade_sizeof_rx_meta;
     nrf70_facade_stats, 156, nrf70_facade_sizeof_stats;
 }
@@ -126,6 +127,22 @@ pub struct ScanResult {
     pub bssid: [u8; 6],
     pub security: Security,
     pub mfp: u8,
+}
+/// The association the last link-up announced. `rssi_dbm` and `tx_rate_kbps`
+/// are the RPU's latest [`Event::LinkInfo`] reply for it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LinkInfo {
+    pub ssid: [u8; MAX_SSID_LEN],
+    pub ssid_len: u8,
+    pub bssid: [u8; 6],
+    pub frequency_mhz: u16,
+    /// As negotiated.
+    pub security: Security,
+    /// Whether management frames are protected.
+    pub mfp: bool,
+    /// Beacon average, else the last frame received.
+    pub rssi_dbm: Option<i8>,
+    pub tx_rate_kbps: Option<u32>,
 }
 /// Carries credential bytes, so no `Debug`/`Copy`/`Clone`; the caller zeroizes
 /// its copy after `connect_start` returns.
@@ -208,6 +225,12 @@ pub enum Event {
         generation: u32,
         status: i32,
         reason_code: u16,
+    },
+    /// The RPU answered [`link_info_request`]; with a zero `status`,
+    /// [`link_info`] holds its reply.
+    LinkInfo {
+        generation: u32,
+        status: i32,
     },
     Fatal {
         generation: u32,
@@ -465,6 +488,15 @@ fn wipe<T>(value: &mut T) {
         unsafe { core::ptr::write_volatile(p.add(i), 0) }
     }
 }
+fn security(raw: u8) -> Security {
+    match raw as u32 {
+        raw::nrf70_facade_security_NRF70_FACADE_SECURITY_OPEN => Security::Open,
+        raw::nrf70_facade_security_NRF70_FACADE_SECURITY_WPA2_PSK => Security::Wpa2Psk,
+        raw::nrf70_facade_security_NRF70_FACADE_SECURITY_WPA2_PSK_SHA256 => Security::Wpa2PskSha256,
+        raw::nrf70_facade_security_NRF70_FACADE_SECURITY_WPA3_SAE => Security::Wpa3Sae,
+        _ => Security::Other,
+    }
+}
 fn raw_security(s: Security) -> u8 {
     (match s {
         Security::Open => raw::nrf70_facade_security_NRF70_FACADE_SECURITY_OPEN,
@@ -533,6 +565,26 @@ pub unsafe fn controlled_port(authorized: bool, peer: [u8; 6]) -> Result<(), Sta
 /// # Safety Call only from the serialized runner.
 pub unsafe fn set_power_save(enabled: bool) -> Result<(), Status> {
     result(unsafe { raw::nrf70_facade_set_power_save(enabled as u8) })
+}
+/// Asks the RPU for the AP's station statistics; [`Event::LinkInfo`] follows.
+/// # Safety Call only from the serialized runner.
+pub unsafe fn link_info_request() -> Result<(), Status> {
+    result(unsafe { raw::nrf70_facade_link_info_request() })
+}
+/// # Safety Call only from the serialized runner.
+pub unsafe fn link_info() -> LinkInfo {
+    let mut l = raw::nrf70_facade_link_info::default();
+    unsafe { raw::nrf70_facade_link_info_get(&mut l) };
+    LinkInfo {
+        ssid: l.ssid,
+        ssid_len: l.ssid_len,
+        bssid: l.bssid,
+        frequency_mhz: l.frequency_mhz,
+        security: security(l.security),
+        mfp: l.mfp != 0,
+        rssi_dbm: (l.rssi_dbm != i8::MIN).then_some(l.rssi_dbm),
+        tx_rate_kbps: (l.tx_rate_kbps != 0).then_some(l.tx_rate_kbps),
+    }
 }
 /// # Safety Call only from the serialized runner.
 pub unsafe fn coex_configure(sr_protocol: u8) -> Result<(), Status> {
@@ -608,19 +660,7 @@ pub unsafe fn event_pop() -> Option<Event> {
                     band: s.band,
                     rssi_dbm: s.rssi_dbm,
                     bssid: s.bssid,
-                    security: match s.security as u32 {
-                        raw::nrf70_facade_security_NRF70_FACADE_SECURITY_OPEN => Security::Open,
-                        raw::nrf70_facade_security_NRF70_FACADE_SECURITY_WPA2_PSK => {
-                            Security::Wpa2Psk
-                        }
-                        raw::nrf70_facade_security_NRF70_FACADE_SECURITY_WPA2_PSK_SHA256 => {
-                            Security::Wpa2PskSha256
-                        }
-                        raw::nrf70_facade_security_NRF70_FACADE_SECURITY_WPA3_SAE => {
-                            Security::Wpa3Sae
-                        }
-                        _ => Security::Other,
-                    },
+                    security: security(s.security),
                     mfp: s.mfp,
                 },
             }
@@ -668,6 +708,10 @@ pub unsafe fn event_pop() -> Option<Event> {
                 reason_code: e.reason_code,
             }
         }
+        raw::nrf70_facade_event_kind_NRF70_FACADE_EVENT_LINK_INFO => Event::LinkInfo {
+            generation,
+            status: e.status,
+        },
         _ => Event::Fatal {
             generation,
             reason: e.status,

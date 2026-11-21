@@ -11,7 +11,7 @@ pub use spi::{BoardControl, SpiTransport};
 use core::cell::RefCell;
 use core::future::{Future, poll_fn};
 use core::pin::{Pin, pin};
-use core::sync::atomic::{AtomicBool, AtomicI8, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use core::task::Poll;
 use embassy_net_driver_channel::{
     self as net_channel,
@@ -22,7 +22,7 @@ use embassy_sync::{
     channel::Channel,
     signal::Signal,
 };
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Timer, with_timeout};
 use heapless::Vec;
 use zeroize::Zeroize;
 
@@ -37,7 +37,8 @@ pub const SECURE_CONNECT_TIMEOUT_US: u32 = 30_000_000;
 /// frame for lack of TX room, and HOST_IRQ still asserted after a full pass.
 const RETRY_POLL_US: u32 = 1_000;
 const EAPOL_ETHERTYPE: [u8; 2] = [0x88, 0x8e];
-const RSSI_UNKNOWN: i8 = i8::MIN;
+/// How long the RPU gets to answer `Wifi::link_info`.
+const LINK_INFO_TIMEOUT: Duration = Duration::from_secs(1);
 pub type EthernetState<const RX: usize, const TX: usize> =
     net_channel::State<ETHERNET_FRAME_SIZE, RX, TX>;
 
@@ -53,6 +54,19 @@ impl Band {
             (Self::TwoGhz, 1..=13) => Some(2407 + channel as u16 * 5),
             (Self::TwoGhz, 14) => Some(2484),
             (Self::FiveGhz, 1..=196) => Some(5000 + channel as u16 * 5),
+            _ => None,
+        }
+    }
+    /// The inverse of [`Band::frequency_mhz`].
+    pub const fn from_frequency_mhz(frequency_mhz: u16) -> Option<(Self, u8)> {
+        match frequency_mhz {
+            2484 => Some((Self::TwoGhz, 14)),
+            2412..=2472 if (frequency_mhz - 2407).is_multiple_of(5) => {
+                Some((Self::TwoGhz, ((frequency_mhz - 2407) / 5) as u8))
+            }
+            5005..=5980 if frequency_mhz.is_multiple_of(5) => {
+                Some((Self::FiveGhz, ((frequency_mhz - 5000) / 5) as u8))
+            }
             _ => None,
         }
     }
@@ -105,6 +119,17 @@ pub enum Security {
     Wpa3Sae,
     Other,
 }
+impl From<nrf70_sys::Security> for Security {
+    fn from(security: nrf70_sys::Security) -> Self {
+        match security {
+            nrf70_sys::Security::Open => Self::Open,
+            nrf70_sys::Security::Wpa2Psk => Self::Wpa2Personal,
+            nrf70_sys::Security::Wpa2PskSha256 => Self::Wpa2Sha256,
+            nrf70_sys::Security::Wpa3Sae => Self::Wpa3Sae,
+            nrf70_sys::Security::Other => Self::Other,
+        }
+    }
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct AccessPoint {
@@ -115,6 +140,45 @@ pub struct AccessPoint {
     pub bssid: [u8; 6],
     pub security: Security,
     pub mfp: u8,
+}
+/// The current association, from [`Wifi::link_info`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct LinkInfo {
+    pub ssid: Vec<u8, 32>,
+    pub bssid: [u8; 6],
+    pub frequency_mhz: u16,
+    /// The RPU's beacon average in dBm, or the last frame it received when it
+    /// keeps none. Beacons arrive through power save, so this stays current
+    /// where a data frame's RSSI would go stale.
+    pub rssi_dbm: Option<i8>,
+    /// Current transmit rate toward the AP, in kbit/s.
+    pub tx_rate_kbps: Option<u32>,
+    /// What the association negotiated, where a scan only reports a label.
+    pub security: Security,
+    /// Whether management frames are protected.
+    pub mfp: bool,
+}
+impl LinkInfo {
+    /// `None` when [`ConnectRequest::frequency_mhz`] was off the channel grid.
+    pub const fn channel(&self) -> Option<(Band, u8)> {
+        Band::from_frequency_mhz(self.frequency_mhz)
+    }
+}
+impl From<nrf70_sys::LinkInfo> for LinkInfo {
+    fn from(link: nrf70_sys::LinkInfo) -> Self {
+        let mut ssid = Vec::new();
+        let _ = ssid.extend_from_slice(&link.ssid[..link.ssid_len.min(32) as usize]);
+        Self {
+            ssid,
+            bssid: link.bssid,
+            frequency_mhz: link.frequency_mhz,
+            rssi_dbm: link.rssi_dbm,
+            tx_rate_kbps: link.tx_rate_kbps,
+            security: link.security.into(),
+            mfp: link.mfp,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -273,6 +337,9 @@ pub enum LinkEvent {
     Up {
         frequency_mhz: u16,
         rssi_dbm: i8,
+        bssid: [u8; 6],
+        /// As negotiated; see [`LinkInfo::security`].
+        security: Security,
     },
     Down {
         reason_code: u16,
@@ -341,7 +408,10 @@ pub struct Resources {
     events: Channel<CriticalSectionRawMutex, LinkEvent, 8>,
     irq: Signal<CriticalSectionRawMutex, ()>,
     wake: Signal<CriticalSectionRawMutex, ()>,
-    rssi: AtomicI8,
+    /// `Wifi::link_info` bypasses the command channel, so that it never finds
+    /// the driver busy nor makes it so.
+    link_info_wanted: AtomicBool,
+    link_info: Signal<CriticalSectionRawMutex, Result<LinkInfo, Error>>,
     cancel_id: AtomicU32,
     next_id: AtomicU32,
     busy: AtomicBool,
@@ -359,7 +429,8 @@ impl Resources {
             events: Channel::new(),
             irq: Signal::new(),
             wake: Signal::new(),
-            rssi: AtomicI8::new(RSSI_UNKNOWN),
+            link_info_wanted: AtomicBool::new(false),
+            link_info: Signal::new(),
             cancel_id: AtomicU32::new(0),
             next_id: AtomicU32::new(1),
             busy: AtomicBool::new(false),
@@ -727,11 +798,17 @@ impl Wifi<'_> {
     pub async fn next_link_event(&self) -> LinkEvent {
         self.r.events.receive().await
     }
-    /// RSSI of the last frame received from the AP, in dBm; `None` while the
-    /// link is down or before the first frame arrives.
-    pub fn rssi(&self) -> Option<i8> {
-        let rssi = self.r.rssi.load(Ordering::Relaxed);
-        (rssi != RSSI_UNKNOWN).then_some(rssi)
+    /// Describes the association, asking the RPU for its signal and rate.
+    /// Unlike the commands above, this neither fails with `Error::Busy` nor
+    /// causes it, so a task other than the one driving the connection may
+    /// call it; only one call may wait at a time.
+    pub async fn link_info(&self) -> Result<LinkInfo, Error> {
+        self.r.link_info.reset();
+        self.r.link_info_wanted.store(true, Ordering::Release);
+        self.r.wake.signal(());
+        with_timeout(LINK_INFO_TIMEOUT, self.r.link_info.wait())
+            .await
+            .unwrap_or(Err(Error::Timeout))
     }
 }
 
@@ -744,6 +821,9 @@ impl<B: Bus + Send + 'static, const N: usize> Runner<'_, B, N> {
             self.handle_cancel();
             if let Ok(cmd) = self.r.commands.try_receive() {
                 self.command(cmd)
+            }
+            if self.r.link_info_wanted.swap(false, Ordering::AcqRel) {
+                self.request_link_info()
             }
             if self.r.irq.try_take().is_some() {
                 unsafe { nrf70_sys::notify_host_irq() }
@@ -988,6 +1068,17 @@ impl<B: Bus + Send + 'static, const N: usize> Runner<'_, B, N> {
             result: unsafe { nrf70_sys::set_power_save(enabled) }.map_err(Error::from),
         })
     }
+    /// A failure answers at once; otherwise `Event::LinkInfo` does.
+    fn request_link_info(&mut self) {
+        let result = if self.tx_open() {
+            unsafe { nrf70_sys::link_info_request() }.map_err(Error::from)
+        } else {
+            Err(Error::NotConnected)
+        };
+        if let Err(error) = result {
+            self.r.link_info.signal(Err(error))
+        }
+    }
     fn cmd_coex(&mut self, id: u32, protocol: Option<SrProtocol>) {
         let result = unsafe {
             match protocol {
@@ -1076,6 +1167,7 @@ impl<B: Bus + Send + 'static, const N: usize> Runner<'_, B, N> {
                 | nrf70_sys::Event::FirmwareRestart { generation }
                 | nrf70_sys::Event::PortAuthorized { generation }
                 | nrf70_sys::Event::HandshakeFailed { generation, .. }
+                | nrf70_sys::Event::LinkInfo { generation, .. }
                 | nrf70_sys::Event::Fatal { generation, .. } => generation,
             };
             if event_generation != self.generation {
@@ -1134,6 +1226,9 @@ impl<B: Bus + Send + 'static, const N: usize> Runner<'_, B, N> {
                     }
                 }
                 nrf70_sys::Event::RxReady { .. } => {}
+                nrf70_sys::Event::LinkInfo { status, .. } => self.r.link_info.signal(
+                    status_result(status).map(|()| unsafe { nrf70_sys::link_info() }.into()),
+                ),
                 nrf70_sys::Event::FirmwareRestart { generation } => {
                     self.emit(LinkEvent::FirmwareRestart { generation });
                     self.clear_session();
@@ -1157,13 +1252,7 @@ impl<B: Bus + Send + 'static, const N: usize> Runner<'_, B, N> {
                 channel: result.channel,
                 rssi_dbm: result.rssi_dbm,
                 bssid: result.bssid,
-                security: match result.security {
-                    nrf70_sys::Security::Open => Security::Open,
-                    nrf70_sys::Security::Wpa2Psk => Security::Wpa2Personal,
-                    nrf70_sys::Security::Wpa2PskSha256 => Security::Wpa2Sha256,
-                    nrf70_sys::Security::Wpa3Sae => Security::Wpa3Sae,
-                    nrf70_sys::Security::Other => Security::Other,
-                },
+                security: result.security.into(),
                 mfp: result.mfp,
             };
             if self
@@ -1254,16 +1343,16 @@ impl<B: Bus + Send + 'static, const N: usize> Runner<'_, B, N> {
             return;
         }
         self.linked = up;
-        if !up {
-            self.r.rssi.store(RSSI_UNKNOWN, Ordering::Relaxed)
-        }
         if let Some(net) = &mut self.net {
             net.set_link_state(if up { LinkState::Up } else { LinkState::Down })
         }
         self.emit(if up {
+            let ap = unsafe { nrf70_sys::link_info() };
             LinkEvent::Up {
                 frequency_mhz: frequency,
                 rssi_dbm: rssi,
+                bssid: ap.bssid,
+                security: ap.security.into(),
             }
         } else {
             LinkEvent::Down {
@@ -1300,9 +1389,6 @@ impl<B: Bus + Send + 'static, const N: usize> Runner<'_, B, N> {
             match unsafe { nrf70_sys::rx_pop(&mut frame) } {
                 Ok(Some(meta)) => {
                     let n = meta.length as usize;
-                    if self.linked {
-                        self.r.rssi.store(meta.rssi_dbm, Ordering::Relaxed)
-                    }
                     if !(14..=ETHERNET_FRAME_SIZE).contains(&n) {
                         continue;
                     }
@@ -1428,6 +1514,21 @@ fn status_result(status: i32) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_channel_frequency_maps_back() {
+        for (band, channels) in [(Band::TwoGhz, 1..=14), (Band::FiveGhz, 1..=196)] {
+            for channel in channels {
+                let frequency_mhz = band.frequency_mhz(channel).unwrap();
+                assert_eq!(
+                    Band::from_frequency_mhz(frequency_mhz),
+                    Some((band, channel))
+                );
+            }
+        }
+        assert_eq!(Band::from_frequency_mhz(2413), None);
+        assert_eq!(Band::from_frequency_mhz(4920), None);
+    }
 
     #[test]
     fn display_scan_allows_transition_candidates_but_not_open_downgrades() {

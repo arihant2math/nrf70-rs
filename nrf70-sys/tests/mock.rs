@@ -208,8 +208,29 @@ fn phase3_facade_connect_flows() {
     drain();
     let mut scratch = [0u8; nrf70_sys::MAX_FRAME_LEN];
     while matches!(unsafe { nrf70_sys::rx_pop(&mut scratch) }, Ok(Some(_))) {}
+    // The association is described from link-up; the RPU's reply adds the
+    // signal and rate.
+    let link = unsafe { nrf70_sys::link_info() };
+    assert_eq!(&link.ssid[..link.ssid_len as usize], b"phase3-wpa2-5g");
+    assert_eq!((link.bssid, link.frequency_mhz), ([2, 0, 0, 0, 0, 3], 5220));
+    assert_eq!(link.security, nrf70_sys::Security::Wpa2Psk);
+    assert_eq!((link.rssi_dbm, link.tx_rate_kbps), (None, None));
+    unsafe { nrf70_sys::link_info_request().unwrap() };
+    assert!(matches!(
+        unsafe { nrf70_sys::event_pop() },
+        Some(nrf70_sys::Event::LinkInfo { status: 0, .. })
+    ));
+    let link = unsafe { nrf70_sys::link_info() };
+    assert_eq!(
+        (link.rssi_dbm, link.tx_rate_kbps),
+        (Some(-42), Some(54_000))
+    );
     unsafe { nrf70_sys::disconnect(3).unwrap() };
     expect_disconnected();
+    assert_eq!(
+        unsafe { nrf70_sys::link_info_request() },
+        Err(nrf70_sys::Status::NotConnected)
+    );
 
     // (c) wrong password: HANDSHAKE_FAILED with reason 23, no link, no data path.
     let wrong = target(

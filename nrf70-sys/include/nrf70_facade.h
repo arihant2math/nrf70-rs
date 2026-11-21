@@ -47,7 +47,10 @@ enum nrf70_facade_event_kind {
     /* The 4-way handshake finished and the controlled port is authorized. */
     NRF70_FACADE_EVENT_PORT_AUTHORIZED = 11,
     /* The supplicant gave up: status is a facade status, reason_code an 802.11 reason. */
-    NRF70_FACADE_EVENT_HANDSHAKE_FAILED = 12
+    NRF70_FACADE_EVENT_HANDSHAKE_FAILED = 12,
+    /* The RPU answered nrf70_facade_link_info_request; with a zero status,
+     * nrf70_facade_link_info_get holds its reply. */
+    NRF70_FACADE_EVENT_LINK_INFO = 13
 };
 
 enum nrf70_facade_security {
@@ -151,6 +154,19 @@ struct nrf70_facade_event {
     struct nrf70_facade_scan_result scan;
 };
 
+/* The association the last LINK up announced. rssi_dbm and tx_rate_kbps are
+ * the RPU's latest LINK_INFO reply for it. */
+struct nrf70_facade_link_info {
+    uint8_t ssid_len;
+    uint8_t ssid[NRF70_FACADE_MAX_SSID_LEN];
+    uint8_t bssid[6];
+    uint8_t security; /* enum nrf70_facade_security, as negotiated */
+    uint8_t mfp;      /* nonzero when management frames are protected */
+    int8_t rssi_dbm;  /* beacon average, else the last frame; INT8_MIN when unknown */
+    uint16_t frequency_mhz;
+    uint32_t tx_rate_kbps; /* 0 when unknown */
+};
+
 struct nrf70_facade_rx_meta {
     uint32_t generation;
     uint16_t length;
@@ -249,6 +265,11 @@ int32_t nrf70_facade_key_install(const struct nrf70_facade_key *key);
 int32_t nrf70_facade_key_remove(const struct nrf70_facade_key *key);
 int32_t nrf70_facade_controlled_port(uint8_t authorized, const uint8_t peer[6]);
 int32_t nrf70_facade_set_power_save(uint8_t enabled);
+/* Asks the RPU for the AP's station statistics; LINK_INFO follows. The RPU
+ * keeps them current from beacons, so unlike nrf70_facade_rx_meta.rssi_dbm
+ * they do not go stale while power save holds off data frames. */
+int32_t nrf70_facade_link_info_request(void);
+void nrf70_facade_link_info_get(struct nrf70_facade_link_info *info);
 /* Programs the RPU's coexistence hardware with the separate-antenna 2.4 GHz
  * PTA tables for sr_protocol (enum nrf70_facade_coex_sr_protocol). The RPU
  * forgets them on reset, so reissue after every FIRMWARE_RESTART. */
@@ -286,6 +307,7 @@ uint32_t nrf70_facade_sizeof_scan_result(void);
 uint32_t nrf70_facade_sizeof_connect_request(void);
 uint32_t nrf70_facade_sizeof_key(void);
 uint32_t nrf70_facade_sizeof_event(void);
+uint32_t nrf70_facade_sizeof_link_info(void);
 uint32_t nrf70_facade_sizeof_rx_meta(void);
 uint32_t nrf70_facade_sizeof_stats(void);
 

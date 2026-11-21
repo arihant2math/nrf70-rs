@@ -2,7 +2,8 @@
 /* Host mock of facade ABI v3. Connect validation matches facade.c exactly; the
  * handshake is scripted: open -> AUTH/ASSOC/LINK, WPA2 with the passphrase
  * "wrong-password" -> AUTH/ASSOC/HANDSHAKE_FAILED(reason 23) and no link,
- * any other valid WPA2 credential -> AUTH/ASSOC/LINK/PORT_AUTHORIZED. */
+ * any other valid WPA2 credential -> AUTH/ASSOC/LINK/PORT_AUTHORIZED. A link
+ * info request is answered at once with -42 dBm and 54 Mbit/s. */
 #include "nrf70_facade.h"
 #include <string.h>
 
@@ -15,6 +16,7 @@ static struct mock_rx_slot rx[MOCK_RX];
 static struct nrf70_facade_stats stats;
 static uint8_t head, count, rx_head, rx_count, initialized, irq, linked, authorized, conn_active;
 static uint8_t secured, pending_authorize;
+static struct nrf70_facade_link_info link;
 
 static void push(const struct nrf70_facade_event *event) {
     if (count == MOCK_EVENTS) { stats.dropped_events++; return; }
@@ -81,6 +83,9 @@ int32_t nrf70_facade_connect_start(const struct nrf70_facade_connect_request *q)
         return 0; /* linked stays 0: the data path never opens */
     }
     e.kind = NRF70_FACADE_EVENT_LINK; e.link_up = 1; push(&e); linked = 1; stats.link_ups++;
+    memset(&link, 0, sizeof(link));
+    link.ssid_len = q->ssid_len; memcpy(link.ssid, q->ssid, q->ssid_len); memcpy(link.bssid, q->bssid, 6);
+    link.security = q->security; link.rssi_dbm = INT8_MIN; link.frequency_mhz = q->frequency_mhz;
     /* Secured success: PORT_AUTHORIZED is deferred to the next process() call
      * so tests can observe the linked-but-unauthorized handshake window. */
     if (secured) pending_authorize = 1;
@@ -103,6 +108,11 @@ int32_t nrf70_facade_key_install(const struct nrf70_facade_key *k){return initia
 int32_t nrf70_facade_key_remove(const struct nrf70_facade_key *k){return initialized&&k?0:NRF70_FACADE_INVALID;}
 int32_t nrf70_facade_controlled_port(uint8_t a,const uint8_t p[6]){if(!initialized||!p)return NRF70_FACADE_INVALID;authorized=a?1:0;return 0;}
 int32_t nrf70_facade_set_power_save(uint8_t e){(void)e;return initialized?0:NRF70_FACADE_NOT_INITIALIZED;}
+int32_t nrf70_facade_link_info_request(void){
+    if(!initialized)return NRF70_FACADE_NOT_INITIALIZED;if(!linked)return NRF70_FACADE_NOT_CONNECTED;
+    link.rssi_dbm=-42;link.tx_rate_kbps=54000;simple_event(NRF70_FACADE_EVENT_LINK_INFO,0);return 0;
+}
+void nrf70_facade_link_info_get(struct nrf70_facade_link_info *info){if(info)*info=link;}
 int32_t nrf70_facade_coex_configure(uint8_t sr){if(!initialized)return NRF70_FACADE_NOT_INITIALIZED;return sr>NRF70_FACADE_COEX_SR_IEEE802154?NRF70_FACADE_INVALID:0;}
 int32_t nrf70_facade_coex_reset(void){return initialized?0:NRF70_FACADE_NOT_INITIALIZED;}
 int32_t nrf70_facade_tx(uint32_t token,const uint8_t *frame,uint16_t len){
@@ -132,5 +142,5 @@ int32_t nrf70_facade_event_pop(struct nrf70_facade_event *e){if(!e)return NRF70_
 void nrf70_facade_stats_get(struct nrf70_facade_stats *s){if(s)*s=stats;}
 uint8_t nrf70_facade_host_irq_active(void){return ops.host_irq_active?ops.host_irq_active(ops.context):0;}
 uint32_t nrf70_facade_now_us(void){return ops.now_us?ops.now_us(ops.context):0;}
-uint32_t nrf70_facade_sizeof_scan_request(void){return sizeof(struct nrf70_facade_scan_request);}uint32_t nrf70_facade_alignof_scan_request(void){return _Alignof(struct nrf70_facade_scan_request);}uint32_t nrf70_facade_sizeof_scan_result(void){return sizeof(struct nrf70_facade_scan_result);}uint32_t nrf70_facade_sizeof_connect_request(void){return sizeof(struct nrf70_facade_connect_request);}uint32_t nrf70_facade_sizeof_key(void){return sizeof(struct nrf70_facade_key);}uint32_t nrf70_facade_sizeof_event(void){return sizeof(struct nrf70_facade_event);}uint32_t nrf70_facade_sizeof_rx_meta(void){return sizeof(struct nrf70_facade_rx_meta);}uint32_t nrf70_facade_sizeof_stats(void){return sizeof(struct nrf70_facade_stats);}
+uint32_t nrf70_facade_sizeof_scan_request(void){return sizeof(struct nrf70_facade_scan_request);}uint32_t nrf70_facade_alignof_scan_request(void){return _Alignof(struct nrf70_facade_scan_request);}uint32_t nrf70_facade_sizeof_scan_result(void){return sizeof(struct nrf70_facade_scan_result);}uint32_t nrf70_facade_sizeof_connect_request(void){return sizeof(struct nrf70_facade_connect_request);}uint32_t nrf70_facade_sizeof_key(void){return sizeof(struct nrf70_facade_key);}uint32_t nrf70_facade_sizeof_event(void){return sizeof(struct nrf70_facade_event);}uint32_t nrf70_facade_sizeof_link_info(void){return sizeof(struct nrf70_facade_link_info);}uint32_t nrf70_facade_sizeof_rx_meta(void){return sizeof(struct nrf70_facade_rx_meta);}uint32_t nrf70_facade_sizeof_stats(void){return sizeof(struct nrf70_facade_stats);}
 _Static_assert(sizeof(enum nrf70_facade_status)==4,"enum ABI");

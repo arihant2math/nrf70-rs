@@ -76,7 +76,7 @@ struct eapol_slot {
     uint8_t frame[EAPOL_MAX];
 };
 struct conn_ctx {
-    uint8_t state, security, mfp, secured, ssid_len, have_bssid;
+    uint8_t state, security, mfp, use_mfp, secured, ssid_len, have_bssid;
     uint8_t bssid[6], found_bssid[6];
     uint8_t ssid[NRF70_FACADE_MAX_SSID_LEN];
     uint16_t frequency;
@@ -101,6 +101,7 @@ static struct nbuf *tx_in_call;
 static uint8_t tx_freed_in_call;
 static uint16_t associated_frequency, scan_result_count, scan_max_results;
 static int8_t current_rssi;
+static struct nrf70_facade_link_info link;
 static uint32_t generation;
 static struct nrf70_facade_stats counters;
 static struct nrf_wifi_fmac_priv *fmac_priv;
@@ -144,6 +145,7 @@ static void reset_runtime(void) {
     associated_frequency = 0;
     scan_result_count = scan_max_results = 0;
     current_rssi = 0;
+    nrf70_os_memset(&link, 0, sizeof(link));
     fmac_priv = 0;
     fmac_dev = 0;
     sta_vif_idx = MAX_NUM_VIFS;
@@ -933,6 +935,10 @@ static void *rpu_ctx(void) {
 static unsigned char vif_idx(void) {
     return sta_vif_idx;
 }
+/* The AP's address; a secured connect learns it from its scan. */
+static const uint8_t *conn_bssid(void) {
+    return conn.secured ? conn.found_bssid : conn.bssid;
+}
 static void push_simple(uint8_t kind, int32_t status) {
     struct nrf70_facade_event e = {.generation = generation,
                                    .status = status,
@@ -1005,9 +1011,19 @@ static enum nrf_wifi_status carrier_cb(void *vif, enum nrf_wifi_fmac_if_carr_sta
     uint8_t up = state == NRF_WIFI_FMAC_IF_CARR_STATE_ON;
     if (up != linked) {
         linked = up;
-        if (up)
+        if (up) {
             counters.link_ups++;
-        else
+            /* Kept past the teardown that clears conn, so the queued LINK up
+             * can still be described when the host gets to it. */
+            nrf70_os_memset(&link, 0, sizeof(link));
+            link.ssid_len = conn.ssid_len;
+            nrf70_os_memcpy(link.ssid, conn.ssid, conn.ssid_len);
+            nrf70_os_memcpy(link.bssid, conn_bssid(), 6);
+            link.security = conn.security;
+            link.mfp = conn.use_mfp;
+            link.rssi_dbm = INT8_MIN;
+            link.frequency_mhz = conn.frequency;
+        } else
             counters.link_downs++;
         struct nrf70_facade_event e = {.generation = generation,
                                        .kind = NRF70_FACADE_EVENT_LINK,
@@ -1075,10 +1091,33 @@ static void disconnected_cb(void *vif, struct nrf_wifi_umac_event_mlme *e, unsig
                                    .reason_code = reason};
     enqueue_event(&x, 1);
 }
+static int8_t clamp_dbm(long long dbm) {
+    return (int8_t)(dbm < -128 ? -128 : dbm > 127 ? 127 : dbm);
+}
 static void rssi_cb(void *vif, signed short signal) {
     (void)vif;
-    int dbm = MBM_TO_DBM(signal);
-    current_rssi = (int8_t)(dbm < -128 ? -128 : dbm > 127 ? 127 : dbm);
+    current_rssi = clamp_dbm(MBM_TO_DBM(signal));
+}
+/* GET_STATION reply. Like the MLME events, the buffer is only as long as the
+ * RPU declared, so the station statistics must be covered by `len`. */
+static void station_cb(void *vif, struct nrf_wifi_umac_event_new_station *e, unsigned int len) {
+    (void)vif;
+    if (!callbacks_enabled || !linked) return;
+    if (!e || len < offsetof(struct nrf_wifi_umac_event_new_station, assoc_req_ies)) {
+        push_simple(NRF70_FACADE_EVENT_LINK_INFO, NRF70_FACADE_IO);
+        return;
+    }
+    const struct nrf_wifi_sta_info *s = &e->sta_info;
+    link.rssi_dbm = INT8_MIN;
+    if (s->valid_fields & NRF_WIFI_STA_INFO_RX_BEACON_SIGNAL_AVG_VALID)
+        link.rssi_dbm = clamp_dbm(s->rx_beacon_signal_avg);
+    else if (s->valid_fields & NRF_WIFI_STA_INFO_SIGNAL_VALID)
+        link.rssi_dbm = clamp_dbm(s->signal);
+    link.tx_rate_kbps = 0;
+    if ((s->valid_fields & NRF_WIFI_STA_INFO_TX_BITRATE_VALID) &&
+        (s->tx_bitrate.valid_fields & NRF_WIFI_RATE_INFO_BITRATE_VALID))
+        link.tx_rate_kbps = s->tx_bitrate.bitrate * 100u; /* reported in 100 kbit/s */
+    push_simple(NRF70_FACADE_EVENT_LINK_INFO, NRF70_FACADE_OK);
 }
 static void recovery_cb(void *vif, void *event, unsigned int len) {
     (void)vif;
@@ -1299,6 +1338,7 @@ static void fill_callbacks(struct nrf_wifi_fmac_callbk_fns *c) {
     c->deauth_callbk_fn = disconnected_cb;
     c->disassoc_callbk_fn = disconnected_cb;
     c->process_rssi_from_rx = rssi_cb;
+    c->get_station_callbk_fn = station_cb;
 }
 
 static void fmac_stop(void) {
@@ -1701,7 +1741,7 @@ static enum nrf_wifi_status conn_deauth(uint16_t reason) {
     d.reason_code = reason;
     /* FMAC sets MAC_ADDR_VALID only for a nonzero peer. Without it the
      * command can return success without disconnecting the station. */
-    nrf70_os_memcpy(d.mac_addr, conn.secured ? conn.found_bssid : conn.bssid, 6);
+    nrf70_os_memcpy(d.mac_addr, conn_bssid(), 6);
     return nrf_wifi_sys_fmac_deauth(rpu_ctx(), vif_idx(), &d);
 }
 void nrf70_supp_host_deauth(uint16_t reason_code) {
@@ -1831,7 +1871,7 @@ static uint32_t conn_step(void) {
         a.auth_type = NRF_WIFI_AUTHTYPE_OPEN_SYSTEM;
         a.ssid.nrf_wifi_ssid_len = conn.ssid_len;
         nrf70_os_memcpy(a.ssid.nrf_wifi_ssid, conn.ssid, conn.ssid_len);
-        nrf70_os_memcpy(a.nrf_wifi_bssid, conn.secured ? conn.found_bssid : conn.bssid, 6);
+        nrf70_os_memcpy(a.nrf_wifi_bssid, conn_bssid(), 6);
         associated_frequency = conn.frequency;
         if (nrf_wifi_sys_fmac_auth(rpu_ctx(), vif_idx(), &a) != NRF_WIFI_STATUS_SUCCESS)
             conn_fail(1);
@@ -1889,6 +1929,8 @@ static uint32_t conn_step(void) {
             }
             log_msg(1, akm_sha256 ? "connect: RSN accepts PSK-SHA256"
                                   : "connect: RSN accepts WPA2-PSK");
+            conn.security =
+                akm_sha256 ? NRF70_FACADE_SECURITY_WPA2_PSK_SHA256 : NRF70_FACADE_SECURITY_WPA2_PSK;
             conn.assoc_ie_len = NRF70_SUPP_ASSOC_IE_MAX;
             int32_t r =
                 nrf70_supp_start(sta_mac, conn.found_bssid, conn.pmk, conn.mfp, akm_sha256,
@@ -1906,12 +1948,13 @@ static uint32_t conn_step(void) {
             /* use_mfp is the boolean "MFP will actually be used for this
              * association", not the 3-valued policy. */
             a.use_mfp = (conn.mfp == 2 || (conn.mfp == 1 && rsn.mfpc)) ? 1 : 0;
+            conn.use_mfp = a.use_mfp;
         } else
             a.control_port = 0;
         a.center_frequency = conn.frequency;
         a.ssid.nrf_wifi_ssid_len = conn.ssid_len;
         nrf70_os_memcpy(a.ssid.nrf_wifi_ssid, conn.ssid, conn.ssid_len);
-        nrf70_os_memcpy(a.nrf_wifi_bssid, conn.secured ? conn.found_bssid : conn.bssid, 6);
+        nrf70_os_memcpy(a.nrf_wifi_bssid, conn_bssid(), 6);
         log_msg(1, "connect: associating");
         if (nrf_wifi_sys_fmac_assoc(rpu_ctx(), vif_idx(), &a) != NRF_WIFI_STATUS_SUCCESS)
             conn_fail(1);
@@ -2066,6 +2109,17 @@ int32_t nrf70_facade_set_power_save(uint8_t enabled) {
                    NRF_WIFI_STATUS_SUCCESS
                ? 0
                : NRF70_FACADE_IO;
+}
+int32_t nrf70_facade_link_info_request(void) {
+    if (!initialized) return NRF70_FACADE_NOT_INITIALIZED;
+    if (!linked) return NRF70_FACADE_NOT_CONNECTED;
+    return nrf_wifi_sys_fmac_get_station(rpu_ctx(), vif_idx(), link.bssid) ==
+                   NRF_WIFI_STATUS_SUCCESS
+               ? 0
+               : NRF70_FACADE_IO;
+}
+void nrf70_facade_link_info_get(struct nrf70_facade_link_info *info) {
+    if (info) *info = link;
 }
 /* Non-PTA registers first, then the PTA table, as sdk-nrf's coex samples do. */
 int32_t nrf70_facade_coex_configure(uint8_t sr_protocol) {
@@ -2244,6 +2298,9 @@ uint32_t nrf70_facade_sizeof_key(void) {
 }
 uint32_t nrf70_facade_sizeof_event(void) {
     return sizeof(struct nrf70_facade_event);
+}
+uint32_t nrf70_facade_sizeof_link_info(void) {
+    return sizeof(struct nrf70_facade_link_info);
 }
 uint32_t nrf70_facade_sizeof_rx_meta(void) {
     return sizeof(struct nrf70_facade_rx_meta);
