@@ -1442,7 +1442,12 @@ impl<B: Bus + Send + 'static, const N: usize> Runner<'_, B, N> {
         self.clear_session();
         self.set_link(false, 0, 0);
         self.flush_tx();
-        unsafe { nrf70_sys::reset(self.mac, country.bytes()) }.map_err(Error::from)?;
+        // A failed reset leaves the C side uninitialized; tear down ours too
+        // so the driver can be initialized again.
+        if let Err(e) = unsafe { nrf70_sys::reset(self.mac, country.bytes()) } {
+            self.teardown();
+            return Err(e.into());
+        }
         self.generation = unsafe { nrf70_sys::stats() }.generation;
         Ok(())
     }
@@ -1471,11 +1476,14 @@ impl<B: Bus + Send + 'static, const N: usize> Runner<'_, B, N> {
     }
     fn fatal_if_needed(&mut self, result: &Result<(), Error>) {
         if *result == Err(Error::Fatal) {
-            self.fail_operations(Error::Fatal);
-            let _ = unsafe { nrf70_sys::deinit() };
-            self.initialized = false;
-            self.set_link(false, 0, 0)
+            self.teardown()
         }
+    }
+    fn teardown(&mut self) {
+        self.fail_operations(Error::Fatal);
+        let _ = unsafe { nrf70_sys::deinit() };
+        self.initialized = false;
+        self.set_link(false, 0, 0)
     }
 }
 /// Lets other tasks run before the next pass.
