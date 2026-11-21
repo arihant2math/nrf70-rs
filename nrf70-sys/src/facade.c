@@ -19,6 +19,7 @@
 #define EAPOL_SLOTS   4u
 #define EAPOL_MAX     640u
 #define CONN_IE_MAX   128u
+#define CONN_SCAN_ATTEMPTS 3u
 
 /* Connect state machine. Steps advance only in nrf70_facade_process; FMAC
  * event callbacks merely set flags. Open networks skip DERIVE/SCAN/HANDSHAKE.
@@ -83,7 +84,7 @@ struct conn_ctx {
     uint16_t rsn_ie_len, rsnxe_len, assoc_ie_len;
     uint8_t rsn_ie[CONN_IE_MAX], rsnxe[CONN_IE_MAX];
     uint8_t assoc_ie[NRF70_SUPP_ASSOC_IE_MAX];
-    uint8_t scan_fetch, scan_done, auth_ok, auth_fail, assoc_ok, assoc_fail;
+    uint8_t scan_attempts, scan_fetch, scan_done, auth_ok, auth_fail, assoc_ok, assoc_fail;
     uint8_t port_authorized, teardown;
 };
 
@@ -116,6 +117,7 @@ static int (*irq_callback)(void *);
 void *nrf70_os_memset(void *d, int v, size_t n);
 static void conn_reset(void);
 static void conn_teardown_now(void);
+static void conn_fail(uint16_t reason);
 
 static uint32_t now_us(void) {
     return platform && platform->now_us ? platform->now_us(platform->context) : 0;
@@ -1090,6 +1092,11 @@ static void disconnected_cb(void *vif, struct nrf_wifi_umac_event_mlme *e, unsig
     }
     counters.disconnects++;
     linked = 0;
+    /* Deauthenticating mid-handshake is how a WPA2 AP rejects a wrong key. */
+    if (conn.state == CONN_HANDSHAKE && !conn.teardown) {
+        conn_fail(reason);
+        return;
+    }
     if (conn.state != CONN_IDLE) conn.teardown = 1;
     struct nrf70_facade_event x = {.generation = generation,
                                    .kind = NRF70_FACADE_EVENT_DISCONNECTED,
@@ -1114,10 +1121,15 @@ static void station_cb(void *vif, struct nrf_wifi_umac_event_new_station *e, uns
         return;
     }
     const struct nrf_wifi_sta_info *s = &e->sta_info;
-    link.rssi_dbm = INT8_MIN;
-    if (s->valid_fields & NRF_WIFI_STA_INFO_RX_BEACON_SIGNAL_AVG_VALID)
+    /* The RPU flags fields it leaves at 0, and no real reading is 0 dBm or
+     * more, so only negative values count; RX frames are the fallback. */
+    link.rssi_dbm = current_rssi < 0 ? current_rssi : INT8_MIN;
+    if ((s->valid_fields & NRF_WIFI_STA_INFO_SIGNAL_AVG_VALID) && s->signal_avg < 0)
+        link.rssi_dbm = clamp_dbm(s->signal_avg);
+    else if ((s->valid_fields & NRF_WIFI_STA_INFO_RX_BEACON_SIGNAL_AVG_VALID) &&
+             s->rx_beacon_signal_avg < 0)
         link.rssi_dbm = clamp_dbm(s->rx_beacon_signal_avg);
-    else if (s->valid_fields & NRF_WIFI_STA_INFO_SIGNAL_VALID)
+    else if ((s->valid_fields & NRF_WIFI_STA_INFO_SIGNAL_VALID) && s->signal < 0)
         link.rssi_dbm = clamp_dbm(s->signal);
     link.tx_rate_kbps = 0;
     if ((s->valid_fields & NRF_WIFI_STA_INFO_TX_BITRATE_VALID) &&
@@ -1261,6 +1273,17 @@ static void conn_capture_ie(const uint8_t *ies, uint32_t len, uint8_t id, uint8_
         *dst_len = el;
     }
 }
+/* The AP's own channel, from its HT Operation or DS Parameter Set element. */
+static uint16_t ie_frequency(const uint8_t *ies, uint32_t len) {
+    uint16_t el;
+    const uint8_t *e = find_ie(ies, len, 61, &el);
+    if (!e || el < 3) e = find_ie(ies, len, 3, &el);
+    if (!e || el < 3) return 0;
+    if (e[2] >= 1 && e[2] <= 13) return (uint16_t)(2407u + 5u * e[2]);
+    if (e[2] == 14) return 2484;
+    if (e[2] >= 32 && e[2] <= 177) return (uint16_t)(5000u + 5u * e[2]);
+    return 0;
+}
 /* SCAN_CONNECT results: capture the target AP's RSN IE (48) and RSNXE (244)
  * from the probe-response IEs, falling back to the beacon IEs. */
 static void connect_scan_res_cb(void *vif, struct nrf_wifi_umac_event_new_scan_results *r,
@@ -1310,7 +1333,12 @@ static void connect_scan_res_cb(void *vif, struct nrf_wifi_umac_event_new_scan_r
             conn_capture_ie(beacon, beacon_len, 48, conn.rsn_ie, &conn.rsn_ie_len);
             conn_capture_ie(ies, ies_len, 244, conn.rsnxe, &conn.rsnxe_len);
             conn_capture_ie(beacon, beacon_len, 244, conn.rsnxe, &conn.rsnxe_len);
-            if (conn.rsn_ie_len) conn.have_bssid = 1;
+            if (conn.rsn_ie_len) {
+                uint16_t f = ie_frequency(ies, ies_len);
+                conn.have_bssid = 1;
+                if (!f) f = ie_frequency(beacon, beacon_len);
+                if (f) conn.frequency = f;
+            }
         }
     }
     if (!more) conn.scan_done = 1;
@@ -1858,14 +1886,20 @@ static uint32_t conn_step(void) {
                 unsigned char reserve[sizeof(struct nrf_wifi_channel)];
             } ch;
         } scan = {0};
+        /* The last attempt sweeps every channel, for an AP that has moved
+         * or that the display scan misplaced (a 2.4 GHz-only AP has been
+         * reported on 5 GHz channel 36). */
+        uint8_t sweep = conn.scan_attempts == CONN_SCAN_ATTEMPTS - 1;
         scan.info.scan_reason = SCAN_CONNECT;
         scan.info.scan_params.bands =
-            conn.frequency < 3000 ? NRF_WIFI_SCAN_BAND_2GHZ : NRF_WIFI_SCAN_BAND_5GHZ;
+            sweep ? NRF_WIFI_SCAN_BAND_2GHZ | NRF_WIFI_SCAN_BAND_5GHZ
+            : conn.frequency < 3000 ? NRF_WIFI_SCAN_BAND_2GHZ
+                                    : NRF_WIFI_SCAN_BAND_5GHZ;
         scan.info.scan_params.num_scan_ssids = 1;
         scan.info.scan_params.scan_ssids[0].nrf_wifi_ssid_len = conn.ssid_len;
         nrf70_os_memcpy(scan.info.scan_params.scan_ssids[0].nrf_wifi_ssid, conn.ssid,
                         conn.ssid_len);
-        scan.info.scan_params.num_scan_channels = 1;
+        scan.info.scan_params.num_scan_channels = !sweep;
         scan.info.scan_params.dwell_time_active = 50;
         scan.info.scan_params.dwell_time_passive = 130;
         scan.ch.frequency[0] = conn.frequency;
@@ -1885,7 +1919,11 @@ static uint32_t conn_step(void) {
                 NRF_WIFI_STATUS_SUCCESS)
                 conn_fail(1);
         } else if (conn.scan_done) {
-            if (!conn.rsn_ie_len) {
+            if (!conn.rsn_ie_len && ++conn.scan_attempts < CONN_SCAN_ATTEMPTS) {
+                /* One probe on a busy channel is easily missed. */
+                conn.scan_done = 0;
+                conn.state = CONN_SCAN_START;
+            } else if (!conn.rsn_ie_len) {
                 log_msg(3, "connect: no AP RSN IE received");
                 conn_fail(1);
             } else
