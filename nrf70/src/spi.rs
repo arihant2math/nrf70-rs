@@ -21,7 +21,7 @@ pub trait BoardControl {
 }
 
 /// Four-wire nRF7002 SPI transport. `D` owns the SPIM peripheral and CS token;
-/// `C` owns HOST_IRQ, BUCKEN, and IOVDD_CTL. Phase 1 operates it at 8 MHz.
+/// `C` owns HOST_IRQ, BUCKEN, and IOVDD_CTL.
 pub struct SpiTransport<D, C> {
     device: D,
     control: C,
@@ -158,8 +158,8 @@ impl<D: SpiDevice<u8>, C: BoardControl> SpiTransport<D, C> {
                 .map_err(|_| ());
         }
         for (i, word) in dst.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-            // Unlike the two paths above, the latency>0 windows are addressed
-            // without the 0x800000 bit.
+            // Unlike packet RAM and writes, the latency > 0 windows are
+            // addressed without the 0x800000 bit.
             let header = Self::header(0x0b, address + i as u32 * 4);
             let mut scratch = [0u8; 12];
             let n = latency as usize * 4 + 4;
@@ -241,9 +241,9 @@ impl<D: SpiDevice<u8> + Send, C: BoardControl + Send> Bus for SpiTransport<D, C>
     }
 }
 
-/// The C facade only passes nul-terminated static strings (never key material).
-/// # Safety `message` must be null or point to a nul-terminated string that
-/// outlives the returned borrow.
+/// # Safety
+/// `message` must be null or point to a nul-terminated string that outlives
+/// the returned borrow.
 #[cfg(feature = "defmt")]
 unsafe fn c_message<'a>(message: *const core::ffi::c_char) -> &'a str {
     if message.is_null() {

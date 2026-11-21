@@ -122,14 +122,13 @@ struct nrf70_facade_connect_request {
     uint8_t ssid[NRF70_FACADE_MAX_SSID_LEN];
     uint8_t bssid[6];
     uint16_t frequency_mhz;
-    uint8_t security;        /* enum nrf70_facade_security: OPEN or WPA2_PSK */
+    uint8_t security;        /* enum nrf70_facade_security: OPEN or WPA2_PSK(_SHA256) */
     uint8_t mfp;             /* enum nrf70_facade_mfp */
     uint8_t credential_kind; /* enum nrf70_facade_credential_kind */
     uint8_t credential_len;
     uint8_t credential[NRF70_FACADE_MAX_CREDENTIAL_LEN];
 };
 
-/* Kept narrow so Phase 3 can drive key installation without exposing FMAC structs. */
 struct nrf70_facade_key {
     uint8_t key_type;
     uint8_t key_index;

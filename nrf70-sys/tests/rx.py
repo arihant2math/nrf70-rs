@@ -19,7 +19,7 @@ VENDOR = ROOT.parent.parent / "third_party/nrf70-bm/nrf_wifi/fw_if/umac_if"
 
 def function(source, name):
     match = re.search(
-        r"(?:static\s+)?(?:enum\s+\w+|unsigned\s+(?:int|short)|void|int)"
+        r"(?:static\s+)?(?:(?:enum|struct)\s+\w+|unsigned\s+(?:int|short)|void|int)"
         r"\s*\*?\s*\b" + name + r"\([^;{}]*\)\s*\{", source
     )
     assert match, name
@@ -48,8 +48,7 @@ PRELUDE = r"""
 #define PKT_TYPE_MSDU_WITH_MAC 1
 #define PKT_TYPE_MSDU 2
 #define NRF70_FACADE_OK 0
-#define mem_alloc malloc
-#define mem_zalloc(n) calloc(1, (n))
+#define NRF70_FACADE_NO_MEMORY (-4)
 #define mem_free free
 #define nrf_wifi_osal_mem_cpy memcpy
 #define nrf_wifi_osal_mem_set memset
@@ -57,6 +56,8 @@ PRELUDE = r"""
 #define nrf_wifi_osal_nbuf_data_size nbuf_size
 #define nrf_wifi_osal_nbuf_free nbuf_free
 static struct { unsigned nbuf_in_use, nbuf_high_water; } counters;
+static void *try_alloc(size_t n, uint8_t zeroed) { return zeroed ? calloc(1, n) : malloc(n); }
+static void fatal(int32_t reason, const char *msg) { (void)reason; (void)msg; abort(); }
 static struct nbuf *tx_in_call;
 static uint8_t tx_freed_in_call;
 static void tx_complete(uint32_t token, int32_t status) {
@@ -319,8 +320,8 @@ def main():
     for name in ("ieee80211", "eth", "amsdu"):
         code += re.search(r"struct nrf_wifi_fmac_" + name + r"_hdr \{.*?__NRF_WIFI_PKD;",
                           util_header, re.S).group(0) + "\n"
-    code += re.search(r"^struct nbuf \{.*?\};", facade, re.M).group(0) + "\n"
-    for name in ("nbuf_alloc", "nbuf_free", "nbuf_size", "nbuf_data", "nbuf_put",
+    code += re.search(r"^struct nbuf \{.*?\};", facade, re.M | re.S).group(0) + "\n"
+    for name in ("nbuf_try_alloc", "nbuf_alloc", "nbuf_free", "nbuf_size", "nbuf_data", "nbuf_put",
                  "nbuf_pull", "nbuf_push"):
         code += function(facade, name)
     code += FAKES

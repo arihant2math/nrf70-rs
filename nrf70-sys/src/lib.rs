@@ -18,25 +18,29 @@ use core::{
     slice,
 };
 
-pub const MAX_CHANNELS: usize = 32;
-pub const MAX_SSID_LEN: usize = 32;
-pub const MAX_FRAME_LEN: usize = 1514;
-pub const MAX_KEY_LEN: usize = 64;
-pub const MAX_SEQ_LEN: usize = 16;
-pub const MAX_CREDENTIAL_LEN: usize = 64;
-/// `enum nrf70_facade_credential_kind` values for [`ConnectTarget::credential_kind`].
-pub const CREDENTIAL_NONE: u8 = 0;
-pub const CREDENTIAL_PASSPHRASE: u8 = 1;
-pub const CREDENTIAL_PSK: u8 = 2;
-/// `enum nrf70_facade_mfp` values for [`ConnectTarget::mfp`].
-pub const MFP_DISABLED: u8 = 0;
-pub const MFP_OPTIONAL: u8 = 1;
-pub const MFP_REQUIRED: u8 = 2;
-pub const COEX_SR_BLE: u8 = 0;
-pub const COEX_SR_IEEE802154: u8 = 1;
-/// Per entry: compile-time size (and optional `align`) assertion on the bindgen
-/// struct, plus a run-time check against the C side's own `sizeof` (and
-/// `alignof` with `probe`).
+pub const MAX_CHANNELS: usize = raw::NRF70_FACADE_MAX_CHANNELS as usize;
+pub const MAX_SSID_LEN: usize = raw::NRF70_FACADE_MAX_SSID_LEN as usize;
+pub const MAX_FRAME_LEN: usize = raw::NRF70_FACADE_MAX_FRAME_LEN as usize;
+pub const MAX_KEY_LEN: usize = raw::NRF70_FACADE_MAX_KEY_LEN as usize;
+pub const MAX_SEQ_LEN: usize = raw::NRF70_FACADE_MAX_SEQ_LEN as usize;
+pub const MAX_CREDENTIAL_LEN: usize = raw::NRF70_FACADE_MAX_CREDENTIAL_LEN as usize;
+/// Values for [`ConnectTarget::credential_kind`].
+pub const CREDENTIAL_NONE: u8 =
+    raw::nrf70_facade_credential_kind_NRF70_FACADE_CREDENTIAL_NONE as u8;
+pub const CREDENTIAL_PASSPHRASE: u8 =
+    raw::nrf70_facade_credential_kind_NRF70_FACADE_CREDENTIAL_PASSPHRASE as u8;
+pub const CREDENTIAL_PSK: u8 = raw::nrf70_facade_credential_kind_NRF70_FACADE_CREDENTIAL_PSK as u8;
+/// Values for [`ConnectTarget::mfp`].
+pub const MFP_DISABLED: u8 = raw::nrf70_facade_mfp_NRF70_FACADE_MFP_DISABLED as u8;
+pub const MFP_OPTIONAL: u8 = raw::nrf70_facade_mfp_NRF70_FACADE_MFP_OPTIONAL as u8;
+pub const MFP_REQUIRED: u8 = raw::nrf70_facade_mfp_NRF70_FACADE_MFP_REQUIRED_ as u8;
+pub const COEX_SR_BLE: u8 = raw::nrf70_facade_coex_sr_protocol_NRF70_FACADE_COEX_SR_BLE as u8;
+pub const COEX_SR_IEEE802154: u8 =
+    raw::nrf70_facade_coex_sr_protocol_NRF70_FACADE_COEX_SR_IEEE802154 as u8;
+
+/// Asserts each bindgen struct's size (and `align`) at compile time, and
+/// `abi_ok` checks them against the C side's `sizeof` (and `alignof` with
+/// `probe`).
 macro_rules! abi_checks {
     ($($ty:ident, $size:expr, $sizeof:ident $(, align $align:expr)? $(, probe $alignof:ident)?;)*) => {
         $(
@@ -403,7 +407,7 @@ unsafe extern "C" fn fatal(_: *mut c_void, r: i32, m: *const c_char) {
 struct Ops(raw::nrf70_facade_platform_ops);
 unsafe impl Sync for Ops {}
 static OPS: Ops = Ops(raw::nrf70_facade_platform_ops {
-    abi_version: 3,
+    abi_version: raw::NRF70_FACADE_ABI_VERSION,
     context: core::ptr::null_mut(),
     alloc: Some(alloc),
     free: Some(free),
@@ -471,9 +475,9 @@ pub unsafe fn scan_start(q: &ScanRequest) -> Result<(), Status> {
         ssid: q.ssid,
         ..Default::default()
     };
-    for (i, c) in q.channels.iter().enumerate() {
-        r.channels[i].band = c.band;
-        r.channels[i].channel = c.channel;
+    for (r, q) in r.channels.iter_mut().zip(&q.channels) {
+        r.band = q.band;
+        r.channel = q.channel;
     }
     result(unsafe { raw::nrf70_facade_scan_start(&r) })
 }
@@ -536,11 +540,11 @@ pub unsafe fn disconnect(reason: u16) -> Result<(), Status> {
 }
 fn raw_key(k: &Key) -> raw::nrf70_facade_key {
     raw::nrf70_facade_key {
-        key_type: match k.key_type {
-            KeyType::Group => 0,
-            KeyType::Pairwise => 1,
-            KeyType::Peer => 2,
-        },
+        key_type: (match k.key_type {
+            KeyType::Group => raw::nrf70_facade_key_type_NRF70_FACADE_KEY_GROUP,
+            KeyType::Pairwise => raw::nrf70_facade_key_type_NRF70_FACADE_KEY_PAIRWISE,
+            KeyType::Peer => raw::nrf70_facade_key_type_NRF70_FACADE_KEY_PEER,
+        }) as u8,
         key_index: k.key_index,
         key_len: k.key_len,
         seq_len: k.sequence_len,
@@ -612,10 +616,7 @@ pub unsafe fn rx_pop(frame: &mut [u8; MAX_FRAME_LEN]) -> Result<Option<RxMeta>, 
             length: m.length,
             rssi_dbm: m.rssi_dbm,
         })),
-        x => {
-            result(x)?;
-            Err(Status::Fatal)
-        }
+        x => Err(Status::from(x)),
     }
 }
 /// # Safety Call only from thread mode in the serialized runner.
@@ -638,8 +639,7 @@ pub unsafe fn next_deadline_us() -> Option<u32> {
 }
 /// # Safety Call only while the installed platform is alive.
 pub unsafe fn host_irq_active() -> bool {
-    let active = unsafe { raw::nrf70_facade_host_irq_active() };
-    active != 0
+    unsafe { raw::nrf70_facade_host_irq_active() != 0 }
 }
 /// # Safety Call only from the serialized runner.
 pub unsafe fn event_pop() -> Option<Event> {

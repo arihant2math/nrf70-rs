@@ -254,11 +254,9 @@ impl core::fmt::Debug for Credential {
         f.write_str("Credential(..)")
     }
 }
-/// One connect request. When `bssid` and `frequency_mhz` are not both given,
-/// `connect` first scans (SSID-filtered, both bands unless `band` says
-/// otherwise) and picks the best-RSSI
-/// compatible AP; whichever of the two is given filters the candidates, and
-/// the connect frequency always comes from the picked AP's own channel.
+/// When `bssid` and `frequency_mhz` are not both given, `connect` first scans
+/// for `ssid` and picks the best-RSSI compatible AP within `band`; whichever
+/// of the two is given filters the candidates.
 #[derive(Debug)]
 pub struct ConnectRequest {
     pub ssid: Vec<u8, 32>,
@@ -718,8 +716,6 @@ impl Wifi<'_> {
         };
         let mut ssid = [0u8; 32];
         ssid[..request.ssid.len()].copy_from_slice(&request.ssid);
-        // One buffer for the secret bytes on every path, zeroized below once
-        // the target has taken its copy.
         let mut credential = [0u8; 64];
         let (credential_kind, credential_len) = match &request.credential {
             Credential::Open => (nrf70_sys::CREDENTIAL_NONE, 0u8),
@@ -941,16 +937,12 @@ impl<B: Bus + Send + 'static, const N: usize> Runner<'_, B, N> {
         self.session_established = false;
         self.pending_link = None;
     }
-    /// Zeroizes in place; moving the value out would leave a bitwise copy.
+    /// Drops the stashed credentials in place; moving them out would leave a
+    /// bitwise copy behind.
     fn scrub_connect_stash(&self) {
-        self.r.connect_stash.lock(|stash| {
-            let mut slot = stash.borrow_mut();
-            if let Some(params) = slot.as_mut() {
-                params.0.credential.zeroize();
-                params.0.credential_len = 0;
-            }
-            *slot = None;
-        })
+        self.r
+            .connect_stash
+            .lock(|stash| *stash.borrow_mut() = None)
     }
     fn command(&mut self, cmd: Command) {
         match cmd {
@@ -1024,19 +1016,15 @@ impl<B: Bus + Send + 'static, const N: usize> Runner<'_, B, N> {
             // out of the static slot.
             let outcome = self.r.connect_stash.lock(|stash| {
                 let mut slot = stash.borrow_mut();
-                let outcome = match slot.as_mut() {
+                let outcome = match slot.as_ref() {
                     None => Err(Error::InvalidRequest),
                     Some(params) => {
                         let secured = params.0.security != nrf70_sys::Security::Open;
-                        let result = unsafe { nrf70_sys::connect_start(&params.0) }
+                        unsafe { nrf70_sys::connect_start(&params.0) }
                             .map(|_| secured)
-                            .map_err(Error::from);
-                        params.0.credential.zeroize();
-                        params.0.credential_len = 0;
-                        result
+                            .map_err(Error::from)
                     }
                 };
-                // Drops in place; the credential is already zeroized.
                 *slot = None;
                 outcome
             });
@@ -1299,9 +1287,8 @@ impl<B: Bus + Send + 'static, const N: usize> Runner<'_, B, N> {
         if self.linked {
             self.set_link(false, 0, 0);
         } else {
-            // The net link never rose (the Link-up was parked
-            // during the handshake), so set_link would emit
-            // nothing; report the 802.11 reason code directly.
+            // The Link-up was parked during the handshake, so set_link would
+            // emit nothing; report the 802.11 reason code directly.
             self.emit(LinkEvent::Down { reason_code });
         }
         if let Some(id) = self.connect_id.take() {
@@ -1317,8 +1304,8 @@ impl<B: Bus + Send + 'static, const N: usize> Runner<'_, B, N> {
         if self.linked {
             self.set_link(false, 0, 0);
         } else if self.connect_id.is_some() {
-            // A connect failed before the net link ever rose;
-            // surface the reason code that set_link would swallow.
+            // A connect failed before the net link ever rose; surface the
+            // reason code that set_link would swallow.
             self.emit(LinkEvent::Down { reason_code });
         }
         if let Some(id) = self.connect_id.take() {
@@ -1400,15 +1387,13 @@ impl<B: Bus + Send + 'static, const N: usize> Runner<'_, B, N> {
                     dst[..n].copy_from_slice(&frame[..n]);
                     net.rx_done(n)
                 }
-                Ok(None) => return false,
-                Err(_) => return false,
+                Ok(None) | Err(_) => return false,
             }
         }
     }
     /// Sends at most one frame. Returns whether FMAC had no room for it, in
     /// which case it stays queued for a later pass.
     fn pump_tx(&mut self) -> bool {
-        // Second gate against transmitting data frames during the handshake.
         if !self.tx_open() {
             return false;
         }

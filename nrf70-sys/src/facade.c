@@ -23,8 +23,7 @@
 /* Connect state machine. Steps advance only in nrf70_facade_process; FMAC
  * event callbacks merely set flags. Open networks skip DERIVE/SCAN/HANDSHAKE.
  * EAPOL TX/RX use the normal FMAC data path as 0x888E Ethernet frames: this
- * nrf_wifi revision has no control-port TX command (deviation from the plan
- * text, see README). */
+ * nrf_wifi revision has no control-port TX command. */
 enum conn_state {
     CONN_IDLE = 0,
     CONN_DERIVE,     /* sliced PBKDF2 passphrase -> PMK */
@@ -80,7 +79,7 @@ struct conn_ctx {
     uint8_t bssid[6], found_bssid[6];
     uint8_t ssid[NRF70_FACADE_MAX_SSID_LEN];
     uint16_t frequency;
-    uint8_t pmk[NRF70_SUPP_PMK_LEN], pmk_ready;
+    uint8_t pmk[NRF70_SUPP_PMK_LEN];
     uint16_t rsn_ie_len, rsnxe_len, assoc_ie_len;
     uint8_t rsn_ie[CONN_IE_MAX], rsnxe[CONN_IE_MAX];
     uint8_t assoc_ie[NRF70_SUPP_ASSOC_IE_MAX];
@@ -115,6 +114,7 @@ INCBIN(_bin, nrf70_facade_fw, STR(CONFIG_NRF_WIFI_SYS_FW_BIN));
 static void *irq_data;
 static int (*irq_callback)(void *);
 void *nrf70_os_memset(void *d, int v, size_t n);
+static void conn_reset(void);
 static void conn_teardown_now(void);
 
 static uint32_t now_us(void) {
@@ -149,9 +149,7 @@ static void reset_runtime(void) {
     fmac_priv = 0;
     fmac_dev = 0;
     sta_vif_idx = MAX_NUM_VIFS;
-    secure_zero(&conn, sizeof(conn));
-    secure_zero(eapol_slots, sizeof(eapol_slots));
-    eapol_read = eapol_write = eapol_count = 0;
+    conn_reset();
 }
 static void account_call(uint32_t start) {
     uint32_t d = now_us() - start;
@@ -652,9 +650,10 @@ static int sleep_ms(int ms) {
     uint32_t start = now_us();
     for (int i = 0; i < ms; i++) {
         if (platform && platform->delay_us) platform->delay_us(platform->context, 1000u);
+        /* Synchronous BM APIs wait for firmware events. Pump only internal
+         * deferred C work here; Rust-facing callbacks merely enqueue. */
         if (platform && platform->host_irq_active && platform->host_irq_active(platform->context))
-            irq_pending = 1; /* Synchronous BM APIs wait for firmware events. Pump only internal
-                                deferred C work here; Rust-facing callbacks merely enqueue. */
+            irq_pending = 1;
         nrf70_facade_process(8);
     }
     uint32_t d = now_us() - start;
@@ -1156,13 +1155,6 @@ static void get_reg_cb(void *vif, struct nrf_wifi_reg *e, unsigned int len) {
                     fmac_dev->reg_chan_count * sizeof(struct nrf_wifi_get_reg_chn_info));
     fmac_dev->alpha2_valid = true;
 }
-static void fill_callbacks(struct nrf_wifi_fmac_callbk_fns *c);
-
-static void scan_start_cb(void *vif, struct nrf_wifi_umac_event_trigger_scan *e, unsigned int len) {
-    (void)vif;
-    (void)e;
-    (void)len;
-}
 static void scan_done_cb(void *vif, struct nrf_wifi_umac_event_trigger_scan *e, unsigned int len) {
     (void)vif;
     (void)e;
@@ -1274,21 +1266,18 @@ static void conn_capture_ie(const uint8_t *ies, uint32_t len, uint8_t id, uint8_
 static void connect_scan_res_cb(void *vif, struct nrf_wifi_umac_event_new_scan_results *r,
                                 unsigned int len, bool more) {
     (void)vif;
-    if (conn.state != CONN_SCAN_WAIT) {
-        return;
-    }
-    if (r && len >= offsetof(struct nrf_wifi_umac_event_new_scan_results, ies))
+    const size_t header = offsetof(struct nrf_wifi_umac_event_new_scan_results, ies);
+    if (conn.state != CONN_SCAN_WAIT) return;
+    if (r && len >= header)
         log_diag("connect scan: len=%u flags=%x ies=%u beacon=%u more=%u "
                  "bssid=%02x:%02x:%02x:%02x:%02x:%02x",
                  len, r->valid_fields, r->ies_len, r->beacon_ies_len, (unsigned)more,
                  r->mac_addr[0], r->mac_addr[1], r->mac_addr[2], r->mac_addr[3], r->mac_addr[4],
                  r->mac_addr[5]);
-    /* The RPU-declared ies_len/beacon_ies_len must fit inside the delivered
-     * event (the HAL allocates exactly the declared message length); a
-     * malformed event is ignored rather than parsed out of bounds. */
-    if (r && len >= (unsigned int)offsetof(struct nrf_wifi_umac_event_new_scan_results, ies) &&
-        (uint64_t)r->ies_len + (uint64_t)r->beacon_ies_len <=
-            (uint64_t)(len - offsetof(struct nrf_wifi_umac_event_new_scan_results, ies))) {
+    /* The HAL allocates exactly the RPU-declared message length, so a
+     * malformed event whose IEs overrun it is ignored. */
+    if (r && len >= header &&
+        (uint64_t)r->ies_len + (uint64_t)r->beacon_ies_len <= (uint64_t)(len - header)) {
         const uint8_t *ies = r->ies, *beacon = 0;
         uint32_t ies_len = 0, beacon_len = 0;
         /* Probe-response IEs live at ies[0..ies_len) only when IES_VALID.
@@ -1311,9 +1300,7 @@ static void connect_scan_res_cb(void *vif, struct nrf_wifi_umac_event_new_scan_r
         } else {
             uint16_t sl = 0;
             const uint8_t *s = ies_len ? find_ie(ies, ies_len, 0, &sl) : 0;
-            if (!s && beacon_len) {
-                s = find_ie(beacon, beacon_len, 0, &sl);
-            }
+            if (!s && beacon_len) s = find_ie(beacon, beacon_len, 0, &sl);
             match = s && sl == (uint16_t)conn.ssid_len + 2u &&
                     nrf70_os_memcmp(s + 2, conn.ssid, conn.ssid_len) == 0;
         }
@@ -1331,7 +1318,6 @@ static void connect_scan_res_cb(void *vif, struct nrf_wifi_umac_event_new_scan_r
 static void fill_callbacks(struct nrf_wifi_fmac_callbk_fns *c) {
     nrf70_os_memset(c, 0, sizeof(*c));
     c->rpu_recovery_callbk_fn = recovery_cb;
-    c->scan_start_callbk_fn = scan_start_cb;
     c->scan_done_callbk_fn = scan_done_cb;
     c->scan_abort_callbk_fn = scan_abort_cb;
     c->disp_scan_res_callbk_fn = scan_results_cb;
@@ -1468,14 +1454,17 @@ int32_t nrf70_facade_init(const struct nrf70_facade_platform_ops *ops, const uin
 }
 /* Keep the internal IRQ callback until FMAC finishes its synchronous
  * interface-down request. bus_dev_deinit unregisters it afterwards. */
-int32_t nrf70_facade_deinit(void) {
-    if (!initialized) return NRF70_FACADE_NOT_INITIALIZED;
+static void facade_stop(void) {
     callbacks_enabled = 0;
     scan_active = 0;
     conn_teardown_now();
     uint32_t s = now_us();
     fmac_stop();
     account_call(s);
+}
+int32_t nrf70_facade_deinit(void) {
+    if (!initialized) return NRF70_FACADE_NOT_INITIALIZED;
+    facade_stop();
     initialized = 0;
     reset_runtime();
     platform = 0;
@@ -1484,17 +1473,12 @@ int32_t nrf70_facade_deinit(void) {
 int32_t nrf70_facade_reset(const uint8_t mac[6], const uint8_t country[2]) {
     if (!initialized) return NRF70_FACADE_NOT_INITIALIZED;
     if (!mac || !country) return NRF70_FACADE_INVALID;
-    callbacks_enabled = 0;
-    scan_active = 0;
-    conn_teardown_now();
-    uint32_t s = now_us();
-    fmac_stop();
-    account_call(s);
+    facade_stop();
     reset_runtime();
     generation++;
     counters.generation = generation;
     counters.resets++;
-    s = now_us();
+    uint32_t s = now_us();
     int r = fmac_start(mac, country);
     account_call(s);
     if (r || faulted) {
@@ -1521,14 +1505,12 @@ int32_t nrf70_facade_scan_start(const struct nrf70_facade_scan_request *q) {
     if (!initialized) return NRF70_FACADE_NOT_INITIALIZED;
     if (scan_active || (conn.state != CONN_IDLE && conn.state != CONN_AUTHORIZED))
         return NRF70_FACADE_BUSY;
-    if (!q || q->channel_count > 32 || q->ssid_len > NRF70_FACADE_MAX_SSID_LEN)
-        return NRF70_FACADE_INVALID; /* The pinned nrf_wifi_sys_fmac_scan copies
-                                        sizeof(info)+sizeof(struct
-                                        nrf_wifi_channel)*num_scan_channels bytes from this buffer,
-                                        so reserve a zeroed nrf_wifi_channel-sized area per channel;
-                                        only the leading unsigned int frequencies are meaningful on
-                                        the wire (upstream semantics), the rest is zeroed
-                                        facade-owned slack the FMAC over-copy may read. */
+    if (!q || q->channel_count > NRF70_FACADE_MAX_CHANNELS ||
+        q->ssid_len > NRF70_FACADE_MAX_SSID_LEN)
+        return NRF70_FACADE_INVALID;
+    /* nrf_wifi_sys_fmac_scan copies sizeof(struct nrf_wifi_channel) per
+     * channel from this buffer, although only the leading unsigned int
+     * frequencies are meaningful; reserve zeroed slack for the over-read. */
     struct __attribute__((packed)) {
         struct nrf_wifi_umac_scan_info info;
         union {
@@ -1585,7 +1567,6 @@ int32_t nrf70_facade_scan_cancel(void) {
     enqueue_event(&e, 1);
     return 0;
 }
-/* --- connect state machine + supplicant host hooks ------------------------ */
 static uint8_t conn_stepping; /* sleep_ms() re-enters process(); never re-enter wpa_sm */
 static void conn_reset(void) {
     secure_zero(&conn, sizeof(conn));
@@ -1656,13 +1637,9 @@ static int conn_parse_rsn(const uint8_t *ie, uint16_t ie_len, struct conn_rsn_in
 }
 /* Called at process() top level only (never from FMAC callback context). */
 static void conn_teardown_now(void) {
-    /* A connect-reason scan may still be running in the RPU; abort it so it
-     * cannot collide with (or leak stale results into) a later attempt. The
-     * connect scan and the display scan are mutually exclusive via the BUSY
-     * checks, and the !scan_active guard keeps a display scan (and its
-     * scan_suppress bookkeeping) untouched. The stale abort/done event lands
-     * in scan_abort_cb/scan_done_cb after conn is reset to CONN_IDLE, where it
-     * is ignored. */
+    /* Abort a connect scan still running in the RPU so it cannot leak stale
+     * results into a later attempt; its abort/done event then arrives in
+     * CONN_IDLE and is ignored. !scan_active leaves a display scan alone. */
     if ((conn.state == CONN_SCAN_START || conn.state == CONN_SCAN_WAIT) && !scan_active &&
         fmac_dev && sta_vif_idx < MAX_NUM_VIFS)
         nrf_wifi_sys_fmac_abort_scan(fmac_dev, sta_vif_idx);
@@ -1779,6 +1756,52 @@ void nrf70_supp_host_completed(uint8_t rekey) {
     enqueue_event(&e, 1);
 }
 
+/* Checks the AP's RSN IE against the connect policy and starts the
+ * supplicant, filling the RSN fields of the association request. On failure
+ * the connect attempt has already been failed. */
+static int conn_supp_start(struct nrf_wifi_umac_assoc_info *a) {
+    struct conn_rsn_info rsn;
+    if (conn_parse_rsn(conn.rsn_ie, conn.rsn_ie_len, &rsn)) {
+        conn_fail_ex(NRF70_FACADE_INVALID, 0);
+        return -1;
+    }
+    if (!rsn.group_ccmp || !rsn.pairwise_ccmp) {
+        log_msg(3, "connect: AP does not support the required CCMP ciphers");
+        conn_fail(0);
+        return -1;
+    }
+    /* Required MFP needs MFPC; an AP with MFPR cannot be joined with MFP disabled. */
+    if ((conn.mfp == 2 && !rsn.mfpc) || (rsn.mfpr && conn.mfp == 0)) {
+        conn_fail(0);
+        return -1;
+    }
+    if (!rsn.has_psk && !rsn.has_psk_sha256) {
+        log_msg(3, "connect: AP RSN offers no PSK AKM (SAE-only/enterprise unsupported)");
+        conn_fail(0);
+        return -1;
+    }
+    /* Mixed-AKM APs use plain PSK for interop; PSK-SHA256 only when the AP
+     * offers nothing else. */
+    uint8_t akm_sha256 = !rsn.has_psk;
+    log_msg(1, akm_sha256 ? "connect: RSN accepts PSK-SHA256" : "connect: RSN accepts WPA2-PSK");
+    conn.security =
+        akm_sha256 ? NRF70_FACADE_SECURITY_WPA2_PSK_SHA256 : NRF70_FACADE_SECURITY_WPA2_PSK;
+    conn.assoc_ie_len = NRF70_SUPP_ASSOC_IE_MAX;
+    if (nrf70_supp_start(sta_mac, conn.found_bssid, conn.pmk, conn.mfp, akm_sha256, conn.rsn_ie,
+                         conn.rsn_ie_len, conn.rsnxe_len ? conn.rsnxe : 0, conn.rsnxe_len,
+                         conn.assoc_ie, &conn.assoc_ie_len)) {
+        conn_fail(1);
+        return -1;
+    }
+    a->wpa_ie.ie_len = conn.assoc_ie_len;
+    nrf70_os_memcpy(a->wpa_ie.ie, conn.assoc_ie, conn.assoc_ie_len);
+    a->control_port = 1;
+    /* Whether MFP is actually used for this association, not the policy. */
+    a->use_mfp = conn.mfp == 2 || (conn.mfp == 1 && rsn.mfpc);
+    conn.use_mfp = a->use_mfp;
+    return 0;
+}
+
 /* Whether conn_step() would act now rather than wait for an FMAC callback.
  * Must mirror conn_step(): a state that reports ready here but makes no
  * progress there would spin the driver task. */
@@ -1820,7 +1843,6 @@ static uint32_t conn_step(void) {
             conn_fail(1);
         else if (r == 1) {
             log_msg(1, "connect: PMK derived; fetching AP RSN IE");
-            conn.pmk_ready = 1;
             conn.state = CONN_SCAN_START;
         }
         break;
@@ -1898,66 +1920,10 @@ static uint32_t conn_step(void) {
     case CONN_SUPP_SETUP: {
         struct nrf_wifi_umac_assoc_info a = {0};
         if (conn.secured) {
-            struct conn_rsn_info rsn;
-            if (conn_parse_rsn(conn.rsn_ie, conn.rsn_ie_len, &rsn)) {
-                secure_zero(conn.pmk, sizeof(conn.pmk));
-                conn.pmk_ready = 0;
-                conn_fail_ex(NRF70_FACADE_INVALID, 0);
-                break; /* malformed AP RSN IE */
-            }
-            if (!rsn.group_ccmp || !rsn.pairwise_ccmp) {
-                log_msg(3, "connect: AP does not support the required CCMP ciphers");
-                secure_zero(conn.pmk, sizeof(conn.pmk));
-                conn.pmk_ready = 0;
-                conn_fail(0);
-                break;
-            }
-            /* MFP policy vs AP capability: Required needs MFPC; an AP with
-             * MFPR cannot be joined with MFP disabled. */
-            if ((conn.mfp == 2 && !rsn.mfpc) || (rsn.mfpr && conn.mfp == 0)) {
-                secure_zero(conn.pmk, sizeof(conn.pmk));
-                conn.pmk_ready = 0;
-                conn_fail(0);
-                break;
-            }
-            /* AKM selection: mixed-AKM APs (PSK + PSK-SHA256) use plain PSK
-             * for interop; PSK-SHA256 only when the AP offers nothing else. */
-            uint8_t akm_sha256;
-            if (rsn.has_psk)
-                akm_sha256 = 0;
-            else if (rsn.has_psk_sha256)
-                akm_sha256 = 1;
-            else {
-                log_msg(3, "connect: AP RSN offers no PSK AKM (SAE-only/enterprise unsupported)");
-                secure_zero(conn.pmk, sizeof(conn.pmk));
-                conn.pmk_ready = 0;
-                conn_fail(0);
-                break;
-            }
-            log_msg(1, akm_sha256 ? "connect: RSN accepts PSK-SHA256"
-                                  : "connect: RSN accepts WPA2-PSK");
-            conn.security =
-                akm_sha256 ? NRF70_FACADE_SECURITY_WPA2_PSK_SHA256 : NRF70_FACADE_SECURITY_WPA2_PSK;
-            conn.assoc_ie_len = NRF70_SUPP_ASSOC_IE_MAX;
-            int32_t r =
-                nrf70_supp_start(sta_mac, conn.found_bssid, conn.pmk, conn.mfp, akm_sha256,
-                                 conn.rsn_ie, conn.rsn_ie_len, conn.rsnxe_len ? conn.rsnxe : 0,
-                                 conn.rsnxe_len, conn.assoc_ie, &conn.assoc_ie_len);
+            int err = conn_supp_start(&a);
             secure_zero(conn.pmk, sizeof(conn.pmk)); /* wpa_sm keeps the PMK for rekeying */
-            conn.pmk_ready = 0;
-            if (r) {
-                conn_fail(1);
-                break;
-            }
-            a.wpa_ie.ie_len = conn.assoc_ie_len;
-            nrf70_os_memcpy(a.wpa_ie.ie, conn.assoc_ie, conn.assoc_ie_len);
-            a.control_port = 1;
-            /* use_mfp is the boolean "MFP will actually be used for this
-             * association", not the 3-valued policy. */
-            a.use_mfp = (conn.mfp == 2 || (conn.mfp == 1 && rsn.mfpc)) ? 1 : 0;
-            conn.use_mfp = a.use_mfp;
-        } else
-            a.control_port = 0;
+            if (err) break;
+        }
         a.center_frequency = conn.frequency;
         a.ssid.nrf_wifi_ssid_len = conn.ssid_len;
         nrf70_os_memcpy(a.ssid.nrf_wifi_ssid, conn.ssid, conn.ssid_len);
@@ -2038,7 +2004,6 @@ int32_t nrf70_facade_connect_start(const struct nrf70_facade_connect_request *q)
         conn.state = CONN_AUTH_START;
     } else if (q->credential_kind == NRF70_FACADE_CREDENTIAL_PSK) {
         nrf70_os_memcpy(conn.pmk, q->credential, NRF70_SUPP_PMK_LEN);
-        conn.pmk_ready = 1;
         conn.state = CONN_SCAN_START;
     } else {
         if (nrf70_supp_pbkdf2_start(q->credential, q->credential_len, q->ssid, q->ssid_len)) {
@@ -2205,7 +2170,7 @@ uint32_t nrf70_facade_process(uint32_t budget) {
     uint32_t ran = 0;
     while (ran < budget) {
         uint8_t did = 0;
-        if (irq_pending && irq_callback && ran < budget) {
+        if (irq_pending && irq_callback) {
             irq_pending = 0;
             irq_callback(irq_data);
             ran++;

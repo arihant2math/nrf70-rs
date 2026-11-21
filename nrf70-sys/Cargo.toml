@@ -3,14 +3,12 @@ name = "nrf70-sys"
 version = "0.1.0"
 edition = "2024"
 links = "nrf70_system"
-build = "build.rs"
 license = "BSD-3-Clause"
 description = "Private nRF70 system-mode FMAC C binding"
 publish = false
 
 [features]
-default = []
-# Host-only deterministic backend for unit tests. Production builds must not enable this.
+# Host-only scripted backend for tests.
 mock = []
 
 [dependencies]

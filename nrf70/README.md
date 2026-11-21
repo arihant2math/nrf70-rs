@@ -6,7 +6,7 @@ WPA2-Personal supplicant.
 ```rust,ignore
 let (wifi, runner, device, host_irq) =
     nrf70::new_with_data_plane(resources, platform, net_state);
-spawner.spawn(wifi_runner(runner))?;
+spawner.spawn(wifi_runner(runner)?);
 
 wifi.initialize(mac, nrf70::Country::new(*b"US")?).await?;
 wifi.connect(request).await?;

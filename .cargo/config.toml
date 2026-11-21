@@ -1,7 +1,5 @@
 [build]
 target = "thumbv8m.main-none-eabihf"
 
-# Like mcu/.cargo/config.toml, inherit PATH rather than forcing a developer's
-# macOS paths (which hides Cargo/Rust on Linux CI). For embedded builds on
-# macOS, export PATH="/opt/homebrew/opt/llvm@21/bin:$PATH" before invoking Cargo.
-# nrf70-sys pins Clang 21.x; CI puts that version on PATH explicitly.
+# nrf70-sys needs Clang 21 on PATH, e.g. on macOS:
+# export PATH="/opt/homebrew/opt/llvm@21/bin:$PATH"

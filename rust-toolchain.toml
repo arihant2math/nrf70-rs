@@ -1,6 +1,3 @@
-# nrf70-rs is its own workspace, so rustup finds no toolchain file by walking up
-# from here. Without this, a standalone `cargo build` uses the user's default
-# toolchain with no guarantee the bare-metal target is installed.
 [toolchain]
 channel = "stable"
 components = ["rust-src", "rustfmt", "clippy"]

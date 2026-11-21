@@ -32,8 +32,6 @@ PRELUDE = r"""
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#define mem_alloc malloc
-#define mem_zalloc(n) calloc(1, (n))
 #define mem_free free
 #define nrf70_os_memcpy memcpy
 #define TX_HEADROOM 64
@@ -50,6 +48,8 @@ static void enqueue_event(const struct nrf70_facade_event *e, int terminal) {
     assert(event_count < 16);
     events[event_count++] = *e;
 }
+static void *try_alloc(size_t n, uint8_t zeroed) { return zeroed ? calloc(1, n) : malloc(n); }
+static void fatal(int32_t reason, const char *msg) { (void)reason; (void)msg; abort(); }
 static void *rpu_ctx(void) { return NULL; }
 static unsigned char vif_idx(void) { return 0; }
 enum nrf_wifi_status { NRF_WIFI_STATUS_FAIL, NRF_WIFI_STATUS_SUCCESS };
@@ -110,9 +110,9 @@ int main(void) {
 }
 """
 
-nbuf = re.search(r"^struct nbuf \{.*?\};", source, re.M).group(0)
+nbuf = re.search(r"^struct nbuf \{.*?\};", source, re.M | re.S).group(0)
 code = PRELUDE + nbuf + "\nstatic struct nbuf *tx_in_call;\nstatic uint8_t tx_freed_in_call;\n"
-for name in ("nbuf_alloc", "tx_complete", "nbuf_free", "nbuf_res", "nbuf_put", "nrf70_facade_tx"):
+for name in ("nbuf_try_alloc", "nbuf_alloc", "tx_complete", "nbuf_free", "nbuf_res", "nbuf_put", "nrf70_facade_tx"):
     code += function(name)
 
 with tempfile.TemporaryDirectory() as directory:

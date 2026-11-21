@@ -46,13 +46,12 @@ fn word_aligned(address: u32, buffer: &[u8]) -> bool {
     ((address as usize) | (buffer.as_ptr() as usize) | buffer.len()) & 3 == 0
 }
 
-/// Rust-owned platform state: hardware tokens plus a dedicated bounded control arena.
-/// Put this value in a `StaticCell`; no unconstrained global allocator is used.
+/// The bus plus the bounded arena backing every C allocation. Put this value
+/// in a `StaticCell`.
 ///
-/// The arena is borrowed rather than owned so it can be a plain `static`:
-/// `Arena::new()` is const and all zero, so it lands in `.bss`, whereas a
-/// `Platform` built at runtime is assembled on the stack before it is moved
-/// into its cell, and the arena is usually far larger than the stack.
+/// The arena is borrowed so it can be a `static` in `.bss`; a `Platform` is
+/// built on the stack before moving into its cell, and the arena is usually
+/// far larger than the stack.
 pub struct Platform<B, const ARENA: usize> {
     bus: UnsafeCell<B>,
     arena: &'static Arena<ARENA>,
@@ -71,7 +70,8 @@ impl<B, const N: usize> Platform<B, N> {
     }
 }
 impl<B: Bus + Send, const N: usize> Platform<B, N> {
-    // Safety is provided by nrf70-sys::Platform's serialized-runner contract.
+    // SAFETY: the bus is only reached from the runner, directly or through the
+    // C callbacks it drives, and those calls never nest.
     #[allow(clippy::mut_from_ref)]
     fn bus(&self) -> &mut B {
         unsafe { &mut *self.bus.get() }
@@ -100,13 +100,7 @@ unsafe impl<B: Bus + Send, const N: usize> nrf70_sys::Platform for Platform<B, N
         self.bus().bus_deinit()
     }
     fn read_reg32(&self, a: u32, v: &mut u32) -> i32 {
-        match self.bus().read_reg32(a) {
-            Ok(x) => {
-                *v = x;
-                0
-            }
-            Err(_) => -1,
-        }
+        code(self.bus().read_reg32(a).map(|x| *v = x))
     }
     fn write_reg32(&self, a: u32, v: u32) -> i32 {
         code(self.bus().write_reg32(a, v))

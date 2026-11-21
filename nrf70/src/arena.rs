@@ -22,16 +22,21 @@ impl Block {
 }
 struct State {
     blocks: [Block; BLOCKS],
-    initialized: bool,
     used: u32,
     high: u32,
     failures: u32,
 }
 impl State {
-    const fn new() -> Self {
+    const fn new(size: u32) -> Self {
+        let mut blocks = [Block::EMPTY; BLOCKS];
+        blocks[0] = Block {
+            offset: 0,
+            size,
+            used: false,
+            valid: true,
+        };
         Self {
-            blocks: [Block::EMPTY; BLOCKS],
-            initialized: false,
+            blocks,
             used: 0,
             high: 0,
             failures: 0,
@@ -51,7 +56,7 @@ impl<const N: usize> Arena<N> {
     pub const fn new() -> Self {
         Self {
             storage: UnsafeCell::new(Storage([0; N])),
-            state: Mutex::new(RefCell::new(State::new())),
+            state: Mutex::new(RefCell::new(State::new(N as u32))),
         }
     }
     pub(crate) unsafe fn alloc(&self, size: u32, align: u32, zeroed: bool) -> *mut u8 {
@@ -66,15 +71,6 @@ impl<const N: usize> Arena<N> {
         };
         let offset = critical_section::with(|cs| {
             let mut s = self.state.borrow(cs).borrow_mut();
-            if !s.initialized {
-                s.blocks[0] = Block {
-                    offset: 0,
-                    size: u32::try_from(N).unwrap(),
-                    used: false,
-                    valid: true,
-                };
-                s.initialized = true;
-            }
             let found = s
                 .blocks
                 .iter()
@@ -132,30 +128,21 @@ impl<const N: usize> Arena<N> {
             };
             s.blocks[i].used = false;
             s.used -= s.blocks[i].size;
-            loop {
-                let mut merged = false;
-                for a in 0..BLOCKS {
-                    if !s.blocks[a].valid || s.blocks[a].used {
-                        continue;
-                    }
-                    for b in 0..BLOCKS {
-                        if a == b || !s.blocks[b].valid || s.blocks[b].used {
-                            continue;
-                        }
-                        if s.blocks[a].offset + s.blocks[a].size == s.blocks[b].offset {
-                            s.blocks[a].size += s.blocks[b].size;
-                            s.blocks[b] = Block::EMPTY;
-                            merged = true;
-                            break;
-                        }
-                    }
-                    if merged {
-                        break;
-                    }
-                }
-                if !merged {
-                    break;
-                }
+            // Free blocks are kept coalesced, so only the freed block's
+            // neighbours can merge with it.
+            let free = |b: &Block| b.valid && !b.used;
+            let end = off + s.blocks[i].size;
+            if let Some(next) = s.blocks.iter().position(|b| free(b) && b.offset == end) {
+                s.blocks[i].size += s.blocks[next].size;
+                s.blocks[next] = Block::EMPTY;
+            }
+            if let Some(prev) = s
+                .blocks
+                .iter()
+                .position(|b| free(b) && b.offset + b.size == off)
+            {
+                s.blocks[prev].size += s.blocks[i].size;
+                s.blocks[i] = Block::EMPTY;
             }
         });
     }

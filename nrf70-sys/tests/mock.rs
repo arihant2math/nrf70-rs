@@ -99,9 +99,9 @@ fn drain() {
     while unsafe { nrf70_sys::event_pop() }.is_some() {}
 }
 
-/// The facade is a single global, so all Phase-3 scenarios run in one test.
+/// The facade is a single global, so all scenarios run in one test.
 #[test]
-fn phase3_facade_connect_flows() {
+fn connect_flows() {
     unsafe { nrf70_sys::init(&MOCK, [2, 0, 0, 0, 0, 1], *b"US").unwrap() };
 
     // (a) open connect from a scan result, data loopback, disconnect.
@@ -163,11 +163,8 @@ fn phase3_facade_connect_flows() {
     unsafe { nrf70_sys::disconnect(3).unwrap() };
     expect_disconnected();
 
-    // (b) WPA2-Personal success: connect_start enqueues AUTH, ASSOC, and
-    // LINK up (linked, not yet authorized); PORT_AUTHORIZED only arrives
-    // from the next process() call. In the window between LINK up and
-    // PORT_AUTHORIZED — the 4-way handshake — ordinary data TX must be
-    // rejected (the controlled-port data gate).
+    // (b) WPA2-Personal success: data TX is rejected between LINK up and
+    // PORT_AUTHORIZED, which arrives from the next process() call.
     let wpa2 = target(
         b"phase3-wpa2-5g",
         [2, 0, 0, 0, 0, 3],
@@ -182,8 +179,6 @@ fn phase3_facade_connect_flows() {
         unsafe { nrf70_sys::event_pop() },
         Some(nrf70_sys::Event::Link { up: true, .. })
     ));
-    // PORT_AUTHORIZED must not be queued yet, and data TX must be rejected
-    // while the handshake is in flight.
     assert!(unsafe { nrf70_sys::event_pop() }.is_none());
     assert_eq!(
         unsafe { nrf70_sys::tx(9, &frame) },
@@ -203,7 +198,6 @@ fn phase3_facade_connect_flows() {
     assert_eq!(unsafe { nrf70_sys::next_deadline_us() }, Some(0));
     unsafe { nrf70_sys::process(8) };
     assert_eq!(unsafe { nrf70_sys::next_deadline_us() }, None);
-    // The port is authorized: data TX now succeeds.
     unsafe { nrf70_sys::tx(10, &frame).unwrap() };
     drain();
     let mut scratch = [0u8; nrf70_sys::MAX_FRAME_LEN];
@@ -254,7 +248,6 @@ fn phase3_facade_connect_flows() {
         }
         e => panic!("unexpected {e:?}"),
     }
-    // The link must never rise after a failed handshake.
     while let Some(e) = unsafe { nrf70_sys::event_pop() } {
         assert!(
             !matches!(e, nrf70_sys::Event::Link { up: true, .. }),

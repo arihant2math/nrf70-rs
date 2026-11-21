@@ -23,15 +23,25 @@ void *nrf70_os_malloc(size_t n);
 size_t nrf70_os_strlen(const char *s);
 
 void *nrf70_os_memmove(void *d, const void *s, size_t n) {
-    uint8_t *dd = d; const uint8_t *ss = s;
+    uint8_t *dd = d;
+    const uint8_t *ss = s;
     if (dd == ss || !n) return d;
-    if (dd < ss) { while (n--) *dd++ = *ss++; }
-    else { dd += n; ss += n; while (n--) *--dd = *--ss; }
+    if (dd < ss) {
+        while (n--) *dd++ = *ss++;
+    } else {
+        dd += n;
+        ss += n;
+        while (n--) *--dd = *--ss;
+    }
     return d;
 }
 /* Growing is unsupported (original block size unknown). Only unreachable
  * helper paths call realloc, and they treat NULL as out-of-memory. */
-void *nrf70_os_realloc(void *p, size_t n) { (void)p; (void)n; return NULL; }
+void *nrf70_os_realloc(void *p, size_t n) {
+    (void)p;
+    (void)n;
+    return NULL;
+}
 char *nrf70_os_strdup(const char *s) {
     size_t n = nrf70_os_strlen(s) + 1u;
     char *d = nrf70_os_malloc(n);
@@ -39,35 +49,60 @@ char *nrf70_os_strdup(const char *s) {
     return d;
 }
 int nrf70_os_strncmp(const char *a, const char *b, size_t n) {
-    while (n && *a && *a == *b) { a++; b++; n--; }
+    while (n && *a && *a == *b) {
+        a++;
+        b++;
+        n--;
+    }
     return n ? (int)(uint8_t)*a - (int)(uint8_t)*b : 0;
 }
 char *nrf70_os_strchr(const char *s, int c) {
-    for (;; s++) { if (*s == (char)c) return (char *)s; if (!*s) return NULL; }
+    for (;; s++) {
+        if (*s == (char)c) return (char *)s;
+        if (!*s) return NULL;
+    }
 }
 char *nrf70_os_strrchr(const char *s, int c) {
     const char *r = NULL;
-    for (;; s++) { if (*s == (char)c) r = s; if (!*s) return (char *)r; }
+    for (;; s++) {
+        if (*s == (char)c) r = s;
+        if (!*s) return (char *)r;
+    }
 }
 char *nrf70_os_strstr(const char *h, const char *n) {
     size_t l = nrf70_os_strlen(n);
     if (!l) return (char *)h;
-    for (; *h; h++) if (!nrf70_os_strncmp(h, n, l)) return (char *)h;
+    for (; *h; h++)
+        if (!nrf70_os_strncmp(h, n, l)) return (char *)h;
     return NULL;
 }
-static int digit_val(char c) { return c >= '0' && c <= '9' ? c - '0' : -1; }
+static int digit_val(char c) {
+    return c >= '0' && c <= '9' ? c - '0' : -1;
+}
 int nrf70_os_atoi(const char *s) {
     int v = 0, neg = 0;
     while (*s == ' ' || *s == '\t') s++;
-    if (*s == '-') { neg = 1; s++; } else if (*s == '+') s++;
+    if (*s == '-') {
+        neg = 1;
+        s++;
+    } else if (*s == '+')
+        s++;
     for (; digit_val(*s) >= 0; s++) v = v * 10 + digit_val(*s);
     return neg ? -v : v;
 }
 long nrf70_os_strtol(const char *s, char **end, int base) {
-    long v = 0; int neg = 0;
+    long v = 0;
+    int neg = 0;
     while (*s == ' ' || *s == '\t') s++;
-    if (*s == '-') { neg = 1; s++; } else if (*s == '+') s++;
-    if ((base == 0 || base == 16) && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) { base = 16; s += 2; }
+    if (*s == '-') {
+        neg = 1;
+        s++;
+    } else if (*s == '+')
+        s++;
+    if ((base == 0 || base == 16) && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+        base = 16;
+        s += 2;
+    }
     if (base == 0) base = s[0] == '0' ? 8 : 10;
     for (;; s++) {
         int d = digit_val(*s);
@@ -81,22 +116,29 @@ long nrf70_os_strtol(const char *s, char **end, int base) {
 }
 /* Debug-only helpers format through vsnprintf; emit an empty string. */
 int nrf70_os_vsnprintf(char *dst, size_t n, const char *fmt, va_list ap) {
-    (void)fmt; (void)ap;
+    (void)fmt;
+    (void)ap;
     if (dst && n) dst[0] = 0;
     return -1;
 }
-void nrf70_os_qsort(void *base, size_t nmemb, size_t size,
-                    int (*cmp)(const void *, const void *)) {
+void nrf70_os_qsort(void *base, size_t nmemb, size_t size, int (*cmp)(const void *, const void *)) {
     uint8_t *a = base, tmp[16];
     if (size > sizeof(tmp)) return; /* only int-sized helper arrays exist here */
     for (size_t i = 1; i < nmemb; i++) {
         nrf70_os_memcpy(tmp, a + i * size, size);
         size_t j = i;
-        while (j && cmp(a + (j - 1) * size, tmp) > 0) { nrf70_os_memcpy(a + j * size, a + (j - 1) * size, size); j--; }
+        while (j && cmp(a + (j - 1) * size, tmp) > 0) {
+            nrf70_os_memcpy(a + j * size, a + (j - 1) * size, size);
+            j--;
+        }
         nrf70_os_memcpy(a + j * size, tmp, size);
     }
 }
-void nrf70_os_abort(void) { for (;;) { } } /* wpabuf overflow guard; unreachable */
+/* wpabuf overflow guard; unreachable. */
+void nrf70_os_abort(void) {
+    for (;;) {
+    }
+}
 
 /* os_* shims; os.h maps the rest to the interposed libc set. */
 void *os_zalloc(size_t size) {
@@ -143,15 +185,16 @@ struct supp_timeout {
 };
 static struct supp_timeout supp_timeouts[SUPP_ELOOP_SLOTS];
 
-int eloop_register_timeout(unsigned int secs, unsigned int usecs,
-                           eloop_timeout_handler handler,
+int eloop_register_timeout(unsigned int secs, unsigned int usecs, eloop_timeout_handler handler,
                            void *eloop_data, void *user_data) {
     for (unsigned i = 0; i < SUPP_ELOOP_SLOTS; i++) {
         struct supp_timeout *t = &supp_timeouts[i];
         if (t->used) continue;
         t->used = 1;
         t->deadline_us = nrf70_supp_host_now_us() + secs * 1000000u + usecs;
-        t->handler = handler; t->eloop_data = eloop_data; t->user_data = user_data;
+        t->handler = handler;
+        t->eloop_data = eloop_data;
+        t->user_data = user_data;
         return 0;
     }
     return -1;
@@ -207,8 +250,8 @@ static struct pbkdf2_state pbkdf2;
 
 int32_t nrf70_supp_pbkdf2_start(const uint8_t *passphrase, uint8_t passphrase_len,
                                 const uint8_t *ssid, uint8_t ssid_len) {
-    if (!passphrase || passphrase_len < 8 || passphrase_len > 63 ||
-        !ssid || !ssid_len || ssid_len > 32)
+    if (!passphrase || passphrase_len < 8 || passphrase_len > 63 || !ssid || !ssid_len ||
+        ssid_len > 32)
         return -1;
     forced_memzero(&pbkdf2, sizeof(pbkdf2));
     nrf70_os_memcpy(pbkdf2.pass, passphrase, passphrase_len);
@@ -226,10 +269,12 @@ int32_t nrf70_supp_pbkdf2_step(uint8_t pmk_out[NRF70_SUPP_PMK_LEN]) {
         if (pbkdf2.iter == 0) {
             uint8_t salt[36];
             nrf70_os_memcpy(salt, pbkdf2.ssid, pbkdf2.ssid_len);
-            salt[pbkdf2.ssid_len] = 0; salt[pbkdf2.ssid_len + 1] = 0;
-            salt[pbkdf2.ssid_len + 2] = 0; salt[pbkdf2.ssid_len + 3] = pbkdf2.block;
-            if (hmac_sha1(pbkdf2.pass, pbkdf2.pass_len, salt,
-                          (size_t)pbkdf2.ssid_len + 4, pbkdf2.u))
+            salt[pbkdf2.ssid_len] = 0;
+            salt[pbkdf2.ssid_len + 1] = 0;
+            salt[pbkdf2.ssid_len + 2] = 0;
+            salt[pbkdf2.ssid_len + 3] = pbkdf2.block;
+            if (hmac_sha1(pbkdf2.pass, pbkdf2.pass_len, salt, (size_t)pbkdf2.ssid_len + 4,
+                          pbkdf2.u))
                 return -1;
             nrf70_os_memcpy(pbkdf2.t, pbkdf2.u, SHA1_MAC_LEN);
             pbkdf2.iter = 1;
@@ -244,8 +289,8 @@ int32_t nrf70_supp_pbkdf2_step(uint8_t pmk_out[NRF70_SUPP_PMK_LEN]) {
             budget--;
         }
         if (pbkdf2.iter == 4096) {
-            nrf70_os_memcpy(&pbkdf2.out[(pbkdf2.block - 1u) * SHA1_MAC_LEN],
-                            pbkdf2.t, SHA1_MAC_LEN);
+            nrf70_os_memcpy(&pbkdf2.out[(pbkdf2.block - 1u) * SHA1_MAC_LEN], pbkdf2.t,
+                            SHA1_MAC_LEN);
             if (pbkdf2.block == 2) {
                 nrf70_os_memcpy(pmk_out, pbkdf2.out, NRF70_SUPP_PMK_LEN);
                 forced_memzero(&pbkdf2, sizeof(pbkdf2));
@@ -260,7 +305,7 @@ int32_t nrf70_supp_pbkdf2_step(uint8_t pmk_out[NRF70_SUPP_PMK_LEN]) {
 
 static struct wpa_sm *supp_sm;
 static enum wpa_states supp_state;
-static uint8_t supp_bssid[6], supp_own_addr[6];
+static uint8_t supp_bssid[6];
 static uint8_t supp_completed_once;
 static int supp_network_ctx; /* fixed identity token for get_network_ctx */
 
@@ -272,32 +317,40 @@ static void supp_set_state(void *ctx, enum wpa_states state) {
         supp_completed_once = 1;
     }
 }
-static enum wpa_states supp_get_state(void *ctx) { (void)ctx; return supp_state; }
+static enum wpa_states supp_get_state(void *ctx) {
+    (void)ctx;
+    return supp_state;
+}
 static void supp_deauthenticate(void *ctx, u16 reason_code) {
     (void)ctx;
     nrf70_supp_host_deauth(reason_code);
 }
-static void supp_reconnect(void *ctx) { (void)ctx; } /* deny_ptk0_rekey unset */
-static int supp_set_key(void *ctx, int link_id, enum wpa_alg alg, const u8 *addr,
-                        int key_idx, int set_tx, const u8 *seq, size_t seq_len,
-                        const u8 *key, size_t key_len, enum key_flag key_flag) {
-    (void)ctx; (void)link_id; (void)set_tx; (void)key_flag;
-    if (alg == WPA_ALG_NONE) return 0; /* key removal: ignored gracefully */
-    if (alg == WPA_ALG_CCMP) {
-        uint8_t pairwise = addr && os_memcmp_const(addr, supp_bssid, 6) == 0 &&
-                           !(addr[0] & 1);
-        return nrf70_supp_host_add_key(pairwise, pairwise ? addr : NULL,
-                                       (uint8_t)key_idx, 0x000FAC04u, key,
-                                       (uint16_t)key_len, seq, (uint16_t)seq_len,
-                                       0) == 0 ? 0 : -1;
-    }
-    if (alg == WPA_ALG_BIP_CMAC_128)
-        return nrf70_supp_host_add_key(0, NULL, (uint8_t)key_idx, 0x000FAC06u,
-                                       key, (uint16_t)key_len, seq,
-                                       (uint16_t)seq_len, 1) == 0 ? 0 : -1;
-    return -1; /* TKIP/GCMP/... are compiled out of this build */
+/* Only used for PTK0 rekey denial, which is not enabled. */
+static void supp_reconnect(void *ctx) {
+    (void)ctx;
 }
-static void *supp_get_network_ctx(void *ctx) { (void)ctx; return &supp_network_ctx; }
+static int supp_set_key(void *ctx, int link_id, enum wpa_alg alg, const u8 *addr, int key_idx,
+                        int set_tx, const u8 *seq, size_t seq_len, const u8 *key, size_t key_len,
+                        enum key_flag key_flag) {
+    (void)ctx;
+    (void)link_id;
+    (void)set_tx;
+    (void)key_flag;
+    if (alg == WPA_ALG_NONE) return 0; /* key removal is not forwarded */
+    if (alg != WPA_ALG_CCMP && alg != WPA_ALG_BIP_CMAC_128)
+        return -1; /* TKIP/GCMP/... are compiled out of this build */
+    uint8_t is_mgmt = alg == WPA_ALG_BIP_CMAC_128;
+    uint8_t pairwise =
+        !is_mgmt && addr && os_memcmp_const(addr, supp_bssid, 6) == 0 && !(addr[0] & 1);
+    int32_t r = nrf70_supp_host_add_key(pairwise, pairwise ? addr : NULL, (uint8_t)key_idx,
+                                        is_mgmt ? 0x000FAC06u : 0x000FAC04u, key, (uint16_t)key_len,
+                                        seq, (uint16_t)seq_len, is_mgmt);
+    return r ? -1 : 0;
+}
+static void *supp_get_network_ctx(void *ctx) {
+    (void)ctx;
+    return &supp_network_ctx;
+}
 static int supp_get_bssid(void *ctx, u8 *bssid) {
     (void)ctx;
     nrf70_os_memcpy(bssid, supp_bssid, 6);
@@ -307,10 +360,16 @@ static int supp_ether_send(void *ctx, const u8 *dest, u16 proto, const u8 *buf, 
     (void)ctx;
     return (int)nrf70_supp_host_ether_send(dest, proto, buf, len);
 }
-static int supp_get_beacon_ie(void *ctx) { (void)ctx; return -1; } /* IE set up front */
-static void supp_cancel_auth_timeout(void *ctx) { (void)ctx; }
-static u8 *supp_alloc_eapol(void *ctx, u8 type, const void *data, u16 data_len,
-                            size_t *msg_len, void **data_pos) {
+/* The AP's RSN IE is set up front by nrf70_supp_start. */
+static int supp_get_beacon_ie(void *ctx) {
+    (void)ctx;
+    return -1;
+}
+static void supp_cancel_auth_timeout(void *ctx) {
+    (void)ctx;
+}
+static u8 *supp_alloc_eapol(void *ctx, u8 type, const void *data, u16 data_len, size_t *msg_len,
+                            void **data_pos) {
     (void)ctx;
     struct ieee802_1x_hdr *hdr;
     *msg_len = sizeof(*hdr) + data_len;
@@ -319,27 +378,29 @@ static u8 *supp_alloc_eapol(void *ctx, u8 type, const void *data, u16 data_len,
     hdr->version = EAPOL_VERSION;
     hdr->type = type;
     hdr->length = host_to_be16(data_len);
-    if (data) nrf70_os_memcpy(hdr + 1, data, data_len);
-    else nrf70_os_memset(hdr + 1, 0, data_len);
+    if (data)
+        nrf70_os_memcpy(hdr + 1, data, data_len);
+    else
+        nrf70_os_memset(hdr + 1, 0, data_len);
     if (data_pos) *data_pos = hdr + 1;
     return (u8 *)hdr;
 }
-static int supp_mlme_setprotection(void *ctx, const u8 *addr, int protection_type,
-                                   int key_type) {
-    (void)ctx; (void)addr; (void)protection_type; (void)key_type;
+static int supp_mlme_setprotection(void *ctx, const u8 *addr, int protection_type, int key_type) {
+    (void)ctx;
+    (void)addr;
+    (void)protection_type;
+    (void)key_type;
     return 0; /* FullMAC firmware enables protection with the installed keys */
 }
 
 int32_t nrf70_supp_start(const uint8_t own_addr[6], const uint8_t bssid[6],
-                         const uint8_t pmk[NRF70_SUPP_PMK_LEN], uint8_t mfp,
-                         uint8_t akm_sha256,
-                         const uint8_t *ap_rsn_ie, uint16_t ap_rsn_ie_len,
-                         const uint8_t *ap_rsnxe, uint16_t ap_rsnxe_len,
-                         uint8_t *assoc_ie_out, uint16_t *assoc_ie_len) {
+                         const uint8_t pmk[NRF70_SUPP_PMK_LEN], uint8_t mfp, uint8_t akm_sha256,
+                         const uint8_t *ap_rsn_ie, uint16_t ap_rsn_ie_len, const uint8_t *ap_rsnxe,
+                         uint16_t ap_rsnxe_len, uint8_t *assoc_ie_out, uint16_t *assoc_ie_len) {
     struct wpa_sm_ctx *ctx;
     size_t ie_len;
-    if (supp_sm || !own_addr || !bssid || !pmk || !ap_rsn_ie || !ap_rsn_ie_len ||
-        !assoc_ie_out || !assoc_ie_len)
+    if (supp_sm || !own_addr || !bssid || !pmk || !ap_rsn_ie || !ap_rsn_ie_len || !assoc_ie_out ||
+        !assoc_ie_len)
         return -1;
     ctx = os_zalloc(sizeof(*ctx)); /* wpa_sm_deinit frees this */
     if (!ctx) return -1;
@@ -362,9 +423,8 @@ int32_t nrf70_supp_start(const uint8_t own_addr[6], const uint8_t bssid[6],
     }
     supp_state = WPA_ASSOCIATING;
     supp_completed_once = 0;
-    nrf70_os_memcpy(supp_own_addr, own_addr, 6);
     nrf70_os_memcpy(supp_bssid, bssid, 6);
-    wpa_sm_set_own_addr(supp_sm, supp_own_addr);
+    wpa_sm_set_own_addr(supp_sm, own_addr);
     wpa_sm_set_param(supp_sm, WPA_PARAM_RSN_ENABLED, 1);
     wpa_sm_set_param(supp_sm, WPA_PARAM_PROTO, WPA_PROTO_RSN);
     wpa_sm_set_param(supp_sm, WPA_PARAM_PAIRWISE, WPA_CIPHER_CCMP);
@@ -375,17 +435,12 @@ int32_t nrf70_supp_start(const uint8_t own_addr[6], const uint8_t bssid[6],
     /* With MFP enabled the AP delivers an IGTK in msg3/group rekeys; the
      * management group cipher must be set or ieee80211w_set_keys() silently
      * discards it and BIP protection never activates. */
-    if (mfp > 0)
-        wpa_sm_set_param(supp_sm, WPA_PARAM_MGMT_GROUP, WPA_CIPHER_AES_128_CMAC);
+    if (mfp > 0) wpa_sm_set_param(supp_sm, WPA_PARAM_MGMT_GROUP, WPA_CIPHER_AES_128_CMAC);
     wpa_sm_set_pmk(supp_sm, pmk, NRF70_SUPP_PMK_LEN, NULL, NULL);
-    if (wpa_sm_set_ap_rsn_ie(supp_sm, ap_rsn_ie, ap_rsn_ie_len))
-        goto fail;
-    if (ap_rsnxe && ap_rsnxe_len &&
-        wpa_sm_set_ap_rsnxe(supp_sm, ap_rsnxe, ap_rsnxe_len))
-        goto fail;
+    if (wpa_sm_set_ap_rsn_ie(supp_sm, ap_rsn_ie, ap_rsn_ie_len)) goto fail;
+    if (ap_rsnxe && ap_rsnxe_len && wpa_sm_set_ap_rsnxe(supp_sm, ap_rsnxe, ap_rsnxe_len)) goto fail;
     ie_len = *assoc_ie_len;
-    if (wpa_sm_set_assoc_wpa_ie_default(supp_sm, assoc_ie_out, &ie_len))
-        goto fail;
+    if (wpa_sm_set_assoc_wpa_ie_default(supp_sm, assoc_ie_out, &ie_len)) goto fail;
     *assoc_ie_len = (uint16_t)ie_len;
     return 0;
 fail:
@@ -413,5 +468,9 @@ void nrf70_supp_stop(void) {
     supp_state = WPA_DISCONNECTED;
     supp_completed_once = 0;
 }
-void nrf70_supp_clear_secrets(void) { forced_memzero(&pbkdf2, sizeof(pbkdf2)); }
-uint8_t nrf70_supp_active(void) { return supp_sm != NULL; }
+void nrf70_supp_clear_secrets(void) {
+    forced_memzero(&pbkdf2, sizeof(pbkdf2));
+}
+uint8_t nrf70_supp_active(void) {
+    return supp_sm != NULL;
+}

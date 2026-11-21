@@ -56,8 +56,8 @@ const HOSTAP_SOURCES: &[&str] = &[
     "src/common/wpa_common.c",
     "src/common/ieee802_11_common.c",
     "src/utils/common.c",
-    /* wpabuf helpers are referenced by ieee802_11_common.c utility paths that
-     * are unreachable for WPA2-PSK but must still satisfy the nm closure. */
+    // Referenced by ieee802_11_common.c paths unreachable for WPA2-PSK, but
+    // needed to satisfy the nm closure.
     "src/utils/wpabuf.c",
     "src/crypto/sha1.c",
     "src/crypto/sha1-internal.c",
@@ -209,8 +209,7 @@ const ZERO_DEFINES: &[&str] = &[
     "CONFIG_NRF70_BAND_UNII_4_UPPER_EDGE_BACKOFF_HE",
 ];
 
-/// The five flags bindgen's libclang invocation needs to agree with the cc
-/// build about the target's type layout.
+/// Flags bindgen also needs to agree with the cc build on type layout.
 const ARM_TARGET: &[&str] = &[
     "--target=arm-none-eabi",
     "-mcpu=cortex-m33",
@@ -227,15 +226,13 @@ const ARM_CODEGEN: &[&str] = &[
     "-ffreestanding",
 ];
 
-/// In-tree edits to pinned vendor sources. Each is applied to a copy written
-/// into OUT_DIR; `edits` are `replacen(.., 1)` in order (order is load-bearing
-/// for hal_api_common.c), and `marker` must survive or the pin has drifted.
+/// In-tree edits to pinned vendor sources, applied to a copy in OUT_DIR. Each
+/// `edits` pattern must occur exactly once at the point it is applied; they
+/// are applied in order (load-bearing for hal_api_common.c).
 struct Patch {
     source: &'static str,
     out_name: &'static str,
     edits: &'static [(&'static str, &'static str)],
-    marker: &'static str,
-    panic_msg: &'static str,
 }
 
 const PATCHES: &[Patch] = &[
@@ -492,8 +489,6 @@ refill:
 }"#,
             ),
         ],
-        marker: "drop_packet:",
-        panic_msg: "pinned RX validation patch no longer applies",
     },
     Patch {
         source: "nrf_wifi/fw_if/umac_if/src/system/fmac_api.c",
@@ -502,8 +497,6 @@ refill:
             "\tif (auth_info->ssid.nrf_wifi_ssid_len > 0) {\n\t\tauth_cmd->valid_fields |= NRF_WIFI_CMD_AUTHENTICATE_SSID_VALID;\n\t}\n",
             "\tif (auth_info->ssid.nrf_wifi_ssid_len > 0) {\n\t\tauth_cmd->valid_fields |= NRF_WIFI_CMD_AUTHENTICATE_SSID_VALID;\n\t}\n\n\tif (!nrf_wifi_util_is_arr_zero(auth_info->nrf_wifi_bssid,\n\t\t\t\t       sizeof(auth_info->nrf_wifi_bssid))) {\n\t\tauth_cmd->valid_fields |= NRF_WIFI_CMD_AUTHENTICATE_BSSID_VALID;\n\t}\n",
         )],
-        marker: "auth_cmd->valid_fields |= NRF_WIFI_CMD_AUTHENTICATE_BSSID_VALID",
-        panic_msg: "pinned open-auth BSSID patch no longer applies",
     },
     Patch {
         source: "nrf_wifi/hw_if/hal/src/common/hal_api_common.c",
@@ -518,8 +511,6 @@ refill:
                 "nrf_wifi_osal_mem_free(event);\n\t\tevent = NULL;\n\t\tfacade_events_processed++;\n\t}\n\tif (facade_events_processed == 1) {\n\t\tnrf_wifi_osal_tasklet_schedule(hal_dev_ctx->event_tasklet);\n\t}\n\nout:\n\treturn status;",
             ),
         ],
-        marker: "facade_events_processed",
-        panic_msg: "pinned event-budget patch no longer applies",
     },
     Patch {
         // The RPU acknowledges every coex table write with
@@ -530,8 +521,6 @@ refill:
             "#endif /* NRF70_RAW_DATA_RX || NRF70_PROMISC_DATA_RX */\n\tdefault:",
             "#endif /* NRF70_RAW_DATA_RX || NRF70_PROMISC_DATA_RX */\n\tcase NRF_WIFI_EVENT_COEX_CONFIG:\n\t\tstatus = NRF_WIFI_STATUS_SUCCESS;\n\t\tbreak;\n\tdefault:",
         )],
-        marker: "case NRF_WIFI_EVENT_COEX_CONFIG:",
-        panic_msg: "pinned coex-config event patch no longer applies",
     },
     Patch {
         source: "nrf_wifi/hw_if/hal/src/common/hal_interrupt.c",
@@ -549,16 +538,9 @@ refill:
                 "\t\tnum_events++;\n\t\tfacade_events_fetched++;\n\t}\n\tif (facade_events_fetched == 1) {\n\t\textern void nrf70_facade_notify_host_irq(void);\n\t\tnrf70_facade_notify_host_irq();\n\t}\n\nout:",
             ),
         ],
-        marker: "facade_events_fetched",
-        panic_msg: "pinned IRQ-budget patch no longer applies",
     },
 ];
 
-fn apply_arm_flags(build: &mut cc::Build) {
-    for flag in ARM_TARGET.iter().chain(ARM_CODEGEN) {
-        build.flag(flag);
-    }
-}
 /// Resolves an LLVM binary shipped in the rustc sysroot for the host triple.
 fn llvm_tool(name: &str) -> PathBuf {
     let sysroot = Command::new(env::var("RUSTC").unwrap_or_else(|_| "rustc".into()))
@@ -570,19 +552,37 @@ fn llvm_tool(name: &str) -> PathBuf {
         env::var("HOST").unwrap()
     ))
 }
-/// Resolves one pinned vendor source, checking it exists and still carries its
-/// license notice, and registers it for rebuild tracking.
-fn vendored(root: &Path, rel: &str, notice: &str, absent_msg: &str, notice_msg: &str) -> PathBuf {
+/// Resolves a pinned vendor source, checking that it still carries its license
+/// notice.
+fn vendored(root: &Path, rel: &str, notice: &str) -> PathBuf {
     let p = root.join(rel);
-    if !p.is_file() {
-        panic!("{absent_msg}: {}", p.display())
-    }
-    if !fs::read_to_string(&p).unwrap_or_default().contains(notice) {
-        panic!("{notice_msg}: {}", p.display())
-    }
+    let source =
+        fs::read_to_string(&p).unwrap_or_else(|e| panic!("vendored source {}: {e}", p.display()));
+    assert!(
+        source.contains(notice),
+        "`{notice}` notice absent: {}",
+        p.display()
+    );
     println!("cargo:rerun-if-changed={}", p.display());
     p
 }
+
+fn patch(path: &Path, patch: &Patch, out: &Path) -> PathBuf {
+    let mut source = fs::read_to_string(path).unwrap();
+    for (i, (from, to)) in patch.edits.iter().enumerate() {
+        assert_eq!(
+            source.matches(from).count(),
+            1,
+            "edit {i} for {} no longer applies to the pinned source",
+            patch.out_name
+        );
+        source = source.replacen(from, to, 1);
+    }
+    let patched = out.join(patch.out_name);
+    fs::write(&patched, source).unwrap();
+    patched
+}
+
 fn hash(path: &Path) -> String {
     format!(
         "{:x}",
@@ -595,76 +595,122 @@ fn require_revision(path: &Path, expected: &str) {
         .output()
         .expect("git is required to verify pinned nRF70 sources");
     let got = String::from_utf8(out.stdout).unwrap();
-    if !out.status.success() || got.trim() != expected {
-        panic!(
-            "pinned revision mismatch at {}: expected {expected}, got {}",
-            path.display(),
-            got.trim()
-        );
-    }
-}
-fn define_args(firmware: &Path) -> Vec<(String, String)> {
-    let mut d = vec![
-        ("NRF70_STA_MODE".into(), "1".into()),
-        // The op-mode gate in fmac_api_common.c needs exactly one of
-        // NRF70_SCAN_ONLY / NRF70_SYSTEM_MODE / NRF70_SYSTEM_WITH_RAW_MODES;
-        // this must match the embedded blob's feature flag (default = system).
-        ("NRF70_SYSTEM_MODE".into(), "1".into()),
-        ("NRF70_DATA_TX".into(), "1".into()),
-        ("CONFIG_NRF70_BOARD_TYPE_EK".into(), "1".into()),
-        ("CONFIG_NRF70_BM_LOG_LEVEL".into(), "0".into()),
-        ("CONFIG_NRF70_SCAN_SSID_FILT_MAX".into(), "2".into()),
-        ("CONFIG_NRF70_SCAN_CHAN_MAX_MANUAL".into(), "32".into()),
-        ("CONFIG_NRF_WIFI_SCAN_MAX_BSS_CNT".into(), "64".into()),
-        ("CONFIG_NRF70_OTP_MAC_ADDRESS".into(), "1".into()),
-        ("CONFIG_NRF_WIFI_LOW_POWER".into(), "1".into()),
-        ("NRF_WIFI_LOW_POWER".into(), "1".into()),
-        ("CONFIG_NRF_WIFI_BEAMFORMING".into(), "1".into()),
-        // nrf70_bm_lib's Kconfig numbering: 1 = 2.4 GHz, 2 = 5 GHz, 3 = both.
-        ("CONFIG_NRF_WIFI_OP_BAND".into(), "3".into()),
-        ("NRF_WIFI_MAX_PS_POLL_FAIL_CNT".into(), "10".into()),
-        // Total RX buffers across all MAX_NUM_OF_RX_QUEUES pools (the HAL
-        // sizes its PKTRAM reservation from this); must divide evenly by 3.
-        ("NRF70_RX_NUM_BUFS".into(), "6".into()),
-        ("NRF70_RX_MAX_DATA_SIZE".into(), "1600".into()),
-        ("NRF70_MAX_TX_TOKENS".into(), "5".into()),
-        ("NRF70_MAX_TX_PENDING_QLEN".into(), "8".into()),
-        ("NRF70_PATCH_DL_CHUNK_SIZE".into(), "4096".into()),
-        ("NRF70_RPU_PS_IDLE_TIMEOUT_MS".into(), "10".into()),
-        ("NRF_WIFI_DISPLAY_SCAN_BSS_LIMIT".into(), "64".into()),
-        (
-            "NRF_WIFI_RPU_MIN_TIME_TO_ENTER_SLEEP_MS".into(),
-            "1000".into(),
-        ),
-        ("NRF_WIFI_IFACE_MTU".into(), "1500".into()),
-        ("NRF_WIFI_AP_DEAD_DETECT_TIMEOUT".into(), "300".into()),
-        ("NRF_WIFI_PS_INT_PS".into(), "1".into()),
-        // Run the RPU's coexistence manager (bt_coex_disable = 0) and compile in
-        // the sleep-control GPIO setup facade.c does after firmware load. The
-        // PTA tables are sent at run time by nrf70_facade_coex_configure.
-        ("NRF70_SR_COEX".into(), "1".into()),
-        ("NRF70_BT_SLOT_TIME".into(), "100".into()),
-        ("NRF70_SR_COEX_SLEEP_CTRL_GPIO_CTRL".into(), "1".into()),
-        ("CONFIG_NRF70_REG_DOMAIN".into(), "00".into()),
-        ("WIFI_NRF70_LOG_LEVEL".into(), "1".into()),
-        (
-            "CONFIG_NRF_WIFI_SYS_FW_BIN".into(),
-            firmware.display().to_string(),
-        ),
-    ];
-    d.extend(
-        NRF_WIFI_LIBC_INTERPOSERS
-            .iter()
-            .map(|x| (x.to_string(), format!("nrf70_os_{x}"))),
+    assert!(
+        out.status.success() && got.trim() == expected,
+        "pinned revision mismatch at {}: expected {expected}, got {}",
+        path.display(),
+        got.trim()
     );
-    d.extend(ZERO_DEFINES.iter().map(|x| (x.to_string(), "0".into())));
-    d.extend(
+}
+
+/// Fails unless every symbol either archive leaves undefined is defined by
+/// the other (facade.c and supplicant.c depend on each other).
+fn check_symbol_closure(out: &Path) {
+    let nm = llvm_tool("llvm-nm");
+    assert!(
+        nm.is_file(),
+        "llvm-nm is required for the OSAL undefined-symbol inventory"
+    );
+    let archives = [
+        out.join("libnrf70_system.a"),
+        out.join("libnrf70_supplicant.a"),
+    ];
+    let symbols = |kind: &str| -> BTreeSet<String> {
+        let mut set = BTreeSet::new();
+        for archive in &archives {
+            let o = Command::new(&nm)
+                .args([kind, "--format=posix", archive.to_str().unwrap()])
+                .output()
+                .expect("llvm-nm");
+            assert!(o.status.success(), "llvm-nm failed");
+            set.extend(
+                String::from_utf8(o.stdout)
+                    .unwrap()
+                    .lines()
+                    .filter_map(|l| l.split_whitespace().next())
+                    .map(str::to_owned),
+            );
+        }
+        set
+    };
+    let defined = symbols("--defined-only");
+    let external: Vec<_> = symbols("--undefined-only")
+        .into_iter()
+        .filter(|s| {
+            !defined.contains(s)
+                && !matches!(
+                    s.as_str(),
+                    "__aeabi_memclr" | "__aeabi_memclr4" | "__aeabi_memcpy" | "__aeabi_memcpy4"
+                )
+        })
+        .collect();
+    assert!(
+        external.is_empty(),
+        "unresolved nRF70 platform/OSAL symbols: {external:?}"
+    );
+}
+const DEFINES: &[(&str, &str)] = &[
+    ("NRF70_STA_MODE", "1"),
+    // The op-mode gate in fmac_api_common.c needs exactly one of
+    // NRF70_SCAN_ONLY / NRF70_SYSTEM_MODE / NRF70_SYSTEM_WITH_RAW_MODES;
+    // this must match the embedded blob's feature flag (default = system).
+    ("NRF70_SYSTEM_MODE", "1"),
+    ("NRF70_DATA_TX", "1"),
+    ("CONFIG_NRF70_BOARD_TYPE_EK", "1"),
+    ("CONFIG_NRF70_BM_LOG_LEVEL", "0"),
+    ("CONFIG_NRF70_SCAN_SSID_FILT_MAX", "2"),
+    ("CONFIG_NRF70_SCAN_CHAN_MAX_MANUAL", "32"),
+    ("CONFIG_NRF_WIFI_SCAN_MAX_BSS_CNT", "64"),
+    ("CONFIG_NRF70_OTP_MAC_ADDRESS", "1"),
+    ("CONFIG_NRF_WIFI_LOW_POWER", "1"),
+    ("NRF_WIFI_LOW_POWER", "1"),
+    ("CONFIG_NRF_WIFI_BEAMFORMING", "1"),
+    // nrf70_bm_lib's Kconfig numbering: 1 = 2.4 GHz, 2 = 5 GHz, 3 = both.
+    ("CONFIG_NRF_WIFI_OP_BAND", "3"),
+    ("NRF_WIFI_MAX_PS_POLL_FAIL_CNT", "10"),
+    // Total RX buffers across all MAX_NUM_OF_RX_QUEUES pools (the HAL
+    // sizes its PKTRAM reservation from this); must divide evenly by 3.
+    ("NRF70_RX_NUM_BUFS", "6"),
+    ("NRF70_RX_MAX_DATA_SIZE", "1600"),
+    ("NRF70_MAX_TX_TOKENS", "5"),
+    ("NRF70_MAX_TX_PENDING_QLEN", "8"),
+    ("NRF70_PATCH_DL_CHUNK_SIZE", "4096"),
+    ("NRF70_RPU_PS_IDLE_TIMEOUT_MS", "10"),
+    ("NRF_WIFI_DISPLAY_SCAN_BSS_LIMIT", "64"),
+    ("NRF_WIFI_RPU_MIN_TIME_TO_ENTER_SLEEP_MS", "1000"),
+    ("NRF_WIFI_IFACE_MTU", "1500"),
+    ("NRF_WIFI_AP_DEAD_DETECT_TIMEOUT", "300"),
+    ("NRF_WIFI_PS_INT_PS", "1"),
+    // Run the RPU's coexistence manager (bt_coex_disable = 0) and compile in
+    // the sleep-control GPIO setup facade.c does after firmware load. The
+    // PTA tables are sent at run time by nrf70_facade_coex_configure.
+    ("NRF70_SR_COEX", "1"),
+    ("NRF70_BT_SLOT_TIME", "100"),
+    ("NRF70_SR_COEX_SLEEP_CTRL_GPIO_CTRL", "1"),
+    ("CONFIG_NRF70_REG_DOMAIN", "00"),
+    ("WIFI_NRF70_LOG_LEVEL", "1"),
+];
+
+fn define_args(firmware: &Path) -> Vec<(String, String)> {
+    let zero = ZERO_DEFINES.iter().copied().chain(
         ZERO_DEFINES
             .iter()
-            .filter_map(|x| x.strip_prefix("CONFIG_"))
-            .map(|x| (x.to_string(), "0".into())),
+            .filter_map(|x| x.strip_prefix("CONFIG_")),
     );
-    d
+    DEFINES
+        .iter()
+        .map(|&(k, v)| (k.to_owned(), v.to_owned()))
+        .chain([(
+            "CONFIG_NRF_WIFI_SYS_FW_BIN".to_owned(),
+            firmware.display().to_string(),
+        )])
+        .chain(
+            NRF_WIFI_LIBC_INTERPOSERS
+                .iter()
+                .map(|x| (x.to_string(), format!("nrf70_os_{x}"))),
+        )
+        .chain(zero.map(|x| (x.to_owned(), "0".to_owned())))
+        .collect()
 }
 
 fn main() {
@@ -678,14 +724,13 @@ fn main() {
     println!("cargo:rerun-if-changed=vendor");
     let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     let mock = env::var_os("CARGO_FEATURE_MOCK").is_some();
-    let target = env::var("TARGET").unwrap();
-    if !mock && target != TARGET {
-        panic!("real nrf70-sys must be built for {TARGET}; use feature `mock` only for host tests");
-    }
+    assert!(
+        mock || env::var("TARGET").unwrap() == TARGET,
+        "real nrf70-sys must be built for {TARGET}; use feature `mock` only for host tests"
+    );
 
     let mut clang_args = vec!["-Iinclude".to_string(), "-fno-short-enums".into()];
     let mut build = cc::Build::new();
-    let mut supplicant_build: Option<cc::Build> = None;
     build
         .compiler("clang")
         // The pinned Nordic sources contain numerous benign warnings. Since
@@ -697,6 +742,7 @@ fn main() {
         .flag("-fno-short-enums");
     if mock {
         build.file("src/facade_mock.c");
+        build.compile("nrf70_system");
     } else {
         let root = PathBuf::from("../../third_party/nrf70-bm").canonicalize().expect("missing pinned third_party/nrf70-bm submodule; run git submodule update --init --recursive");
         require_revision(&root, NRF70_BM_REV);
@@ -707,89 +753,61 @@ fn main() {
             .output()
             .expect("pinned Clang 21 is required");
         let version = String::from_utf8_lossy(&clang.stdout);
-        if !version
-            .lines()
-            .next()
-            .unwrap_or("")
-            .contains(&format!("{CLANG_MAJOR_VERSION}."))
-        {
-            panic!(
-                "Clang {CLANG_MAJOR_VERSION} is pinned, found: {}",
-                version.lines().next().unwrap_or("unknown")
-            );
-        }
+        let version = version.lines().next().unwrap_or("unknown");
+        assert!(
+            version.contains(&format!("{CLANG_MAJOR_VERSION}.")),
+            "Clang {CLANG_MAJOR_VERSION} is pinned, found: {version}"
+        );
         let fw = root.join("sdk-nrfxlib/nrf_wifi/bin/zephyr/default/nrf70.bin");
         let lic = root.join("sdk-nrfxlib/LICENSE");
-        if hash(&fw) != BLOB_SHA256 {
-            panic!("scan firmware hash mismatch");
-        }
-        if hash(&lic) != LICENSE_SHA256 {
-            panic!("required Nordic license hash mismatch");
-        }
+        assert_eq!(hash(&fw), BLOB_SHA256, "firmware hash mismatch");
+        assert_eq!(
+            hash(&lic),
+            LICENSE_SHA256,
+            "required Nordic license hash mismatch"
+        );
         println!("cargo:rerun-if-changed={}", fw.display());
         println!("cargo:rerun-if-changed={}", lic.display());
         let llvm_ar = llvm_tool("llvm-ar");
         if llvm_ar.is_file() {
             build.archiver(&llvm_ar);
         }
-        apply_arm_flags(&mut build);
+        build.flags(ARM_TARGET).flags(ARM_CODEGEN);
         clang_args.extend(ARM_TARGET.iter().map(|x| x.to_string()));
         for i in INCLUDES {
             let p = root.join(i);
             build.include(&p);
             clang_args.push(format!("-I{}", p.display()));
         }
-        let defs = define_args(&fw);
-        for (k, v) in &defs {
-            build.define(k, v.as_str());
+        for (k, v) in define_args(&fw) {
+            build.define(&k, v.as_str());
             if !NRF_WIFI_LIBC_INTERPOSERS.contains(&k.as_str()) {
                 clang_args.push(format!("-D{k}={v}"));
             }
         }
         build.file("src/facade.c");
         let coex = PathBuf::from("vendor/zephyr_nrf_wifi");
-        if hash(&coex.join("coex_struct.h")) != COEX_STRUCT_SHA256 {
-            panic!("vendored coex_struct.h drifted from upstream");
-        }
+        assert_eq!(
+            hash(&coex.join("coex_struct.h")),
+            COEX_STRUCT_SHA256,
+            "vendored coex_struct.h drifted from upstream"
+        );
         for name in ["coex_struct.h", "coex.h", "coex.c"] {
-            vendored(
-                &coex,
-                name,
-                "SPDX-License-Identifier: Apache-2.0",
-                "vendored coex source absent",
-                "required Apache-2.0 notice absent",
-            );
+            vendored(&coex, name, "SPDX-License-Identifier: Apache-2.0");
         }
         build.include(&coex);
         build.file(coex.join("coex.c"));
         for s in SOURCES {
-            let p = vendored(
-                &root,
-                s,
-                "SPDX-License-Identifier: BSD-3-Clause",
-                "pinned source absent",
-                "required BSD-3-Clause notice absent",
-            );
-            if let Some(patch) = PATCHES.iter().find(|x| x.source == *s) {
-                let mut source = fs::read_to_string(&p).unwrap();
-                for (from, to) in patch.edits {
-                    assert_eq!(source.matches(from).count(), 1, "{}", patch.panic_msg);
-                    source = source.replacen(from, to, 1);
-                }
-                if !source.contains(patch.marker) {
-                    panic!("{}", patch.panic_msg)
-                }
-                let patched = out.join(patch.out_name);
-                fs::write(&patched, source).unwrap();
-                build.file(patched);
-            } else {
-                build.file(p);
-            }
+            let p = vendored(&root, s, "SPDX-License-Identifier: BSD-3-Clause");
+            match PATCHES.iter().find(|x| x.source == *s) {
+                Some(x) => build.file(patch(&p, x, &out)),
+                None => build.file(p),
+            };
         }
 
-        /* Second archive: the pinned hostap WPA2-PSK subset plus supplicant.c
-         * (which needs the same defines and shim headers). facade.c stays in
-         * the nrf70_system archive and never sees hostap headers. */
+        // Second archive: the hostap WPA2-PSK subset plus supplicant.c, which
+        // needs the same defines and shim headers. facade.c never sees hostap
+        // headers.
         let hostap = PathBuf::from("../../third_party/hostap").canonicalize().expect(
             "missing pinned third_party/hostap submodule; run git submodule update --init --recursive",
         );
@@ -805,9 +823,10 @@ fn main() {
             // hostap's disabled-feature stubs are intentionally warning-heavy.
             .warnings(false)
             .flag("-std=c11")
-            .flag("-fno-short-enums");
-        apply_arm_flags(&mut supp);
-        supp.include(&shim)
+            .flag("-fno-short-enums")
+            .flags(ARM_TARGET)
+            .flags(ARM_CODEGEN)
+            .include(&shim)
             .include(hostap.join("src"))
             .include(hostap.join("src/utils"));
         if llvm_ar.is_file() {
@@ -819,8 +838,8 @@ fn main() {
         for s in HOSTAP_LIBC_INTERPOSERS {
             supp.define(s, Some(format!("nrf70_os_{s}").as_str()));
         }
-        /* common.h's fallback byte-order block needs these on a freestanding
-         * target; Cortex-M33 is little-endian. */
+        // common.h's fallback byte-order block needs these on a freestanding
+        // target; Cortex-M33 is little-endian.
         supp.define("__BYTE_ORDER", Some("1234"))
             .define("__LITTLE_ENDIAN", Some("1234"))
             .define("__BIG_ENDIAN", Some("4321"))
@@ -832,63 +851,13 @@ fn main() {
                 &hostap,
                 s,
                 "distributed under the terms of the BSD license",
-                "pinned hostap source absent",
-                "required BSD license notice absent",
             ));
         }
         supp.file("src/supplicant.c");
-        supplicant_build = Some(supp);
-    }
-    build.compile("nrf70_system");
-    if let Some(supp) = supplicant_build.as_mut() {
+
+        build.compile("nrf70_system");
         supp.compile("nrf70_supplicant");
-    }
-    if !mock {
-        let nm = llvm_tool("llvm-nm");
-        if !nm.is_file() {
-            panic!("llvm-nm is required for the OSAL undefined-symbol inventory")
-        }
-        /* A symbol undefined in one archive may be defined in the other
-         * (facade.c <-> supplicant.c are mutually dependent); treat the two
-         * archives as one link unit for the closure check. */
-        let archives = [
-            out.join("libnrf70_system.a"),
-            out.join("libnrf70_supplicant.a"),
-        ];
-        let symbols = |kind: &str| -> BTreeSet<String> {
-            let mut set = BTreeSet::new();
-            for archive in &archives {
-                let o = Command::new(&nm)
-                    .args([kind, "--format=posix", archive.to_str().unwrap()])
-                    .output()
-                    .expect("llvm-nm");
-                if !o.status.success() {
-                    panic!("llvm-nm failed")
-                };
-                set.extend(
-                    String::from_utf8(o.stdout)
-                        .unwrap()
-                        .lines()
-                        .filter_map(|l| l.split_whitespace().next())
-                        .map(str::to_owned),
-                );
-            }
-            set
-        };
-        let undefined = symbols("--undefined-only");
-        let defined = symbols("--defined-only");
-        let external: Vec<_> = undefined
-            .difference(&defined)
-            .filter(|s| {
-                !matches!(
-                    s.as_str(),
-                    "__aeabi_memclr" | "__aeabi_memclr4" | "__aeabi_memcpy" | "__aeabi_memcpy4"
-                )
-            })
-            .collect();
-        if !external.is_empty() {
-            panic!("unresolved nRF70 platform/OSAL symbols: {external:?}")
-        }
+        check_symbol_closure(&out);
     }
     let bindings = bindgen::Builder::default()
         .header("include/nrf70_facade.h")

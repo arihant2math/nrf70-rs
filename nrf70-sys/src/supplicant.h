@@ -11,8 +11,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define NRF70_SUPP_PMK_LEN 32u
-#define NRF70_SUPP_ASSOC_IE_MAX 64u
+#define NRF70_SUPP_PMK_LEN            32u
+#define NRF70_SUPP_ASSOC_IE_MAX       64u
 #define NRF70_SUPP_PBKDF2_SLICE_ITERS 256u
 
 /* Implemented in supplicant.c, called by facade.c. */
@@ -32,11 +32,9 @@ int32_t nrf70_supp_pbkdf2_step(uint8_t pmk_out[NRF70_SUPP_PMK_LEN]);
  * mfp>0 enables BIP-CMAC-128 so the IGTK is installed. The caller zeroizes
  * its pmk copy after this returns. */
 int32_t nrf70_supp_start(const uint8_t own_addr[6], const uint8_t bssid[6],
-                         const uint8_t pmk[NRF70_SUPP_PMK_LEN], uint8_t mfp,
-                         uint8_t akm_sha256,
-                         const uint8_t *ap_rsn_ie, uint16_t ap_rsn_ie_len,
-                         const uint8_t *ap_rsnxe, uint16_t ap_rsnxe_len,
-                         uint8_t *assoc_ie_out, uint16_t *assoc_ie_len);
+                         const uint8_t pmk[NRF70_SUPP_PMK_LEN], uint8_t mfp, uint8_t akm_sha256,
+                         const uint8_t *ap_rsn_ie, uint16_t ap_rsn_ie_len, const uint8_t *ap_rsnxe,
+                         uint16_t ap_rsnxe_len, uint8_t *assoc_ie_out, uint16_t *assoc_ie_len);
 void nrf70_supp_notify_assoc(const uint8_t bssid[6]);
 /* frame points at the 802.1X header (Ethernet header already stripped). */
 void nrf70_supp_rx_eapol(const uint8_t src[6], const uint8_t *frame, uint16_t len);
@@ -60,15 +58,13 @@ uint8_t nrf70_supp_host_random_u8(void);
  * installed with a NULL MAC and then set as the default multicast key
  * (is_mgmt!=0 marks an IGTK: default management key instead). seq is the
  * little-endian RSC (6 bytes for CCMP) or empty. */
-int32_t nrf70_supp_host_add_key(uint8_t pairwise, const uint8_t peer[6],
-                                uint8_t key_idx, uint32_t cipher_suite,
-                                const uint8_t *key, uint16_t key_len,
-                                const uint8_t *seq, uint16_t seq_len,
-                                uint8_t is_mgmt);
+int32_t nrf70_supp_host_add_key(uint8_t pairwise, const uint8_t peer[6], uint8_t key_idx,
+                                uint32_t cipher_suite, const uint8_t *key, uint16_t key_len,
+                                const uint8_t *seq, uint16_t seq_len, uint8_t is_mgmt);
 /* Wraps buf in an Ethernet header and sends it through the normal FMAC data
  * path. Does not require the data link to be up. */
-int32_t nrf70_supp_host_ether_send(const uint8_t dst[6], uint16_t proto,
-                                   const uint8_t *buf, size_t len);
+int32_t nrf70_supp_host_ether_send(const uint8_t dst[6], uint16_t proto, const uint8_t *buf,
+                                   size_t len);
 /* Handshake failure: emits HANDSHAKE_FAILED, deauthenticates the radio, and
  * schedules supplicant teardown for the next process() step. */
 void nrf70_supp_host_deauth(uint16_t reason_code);
