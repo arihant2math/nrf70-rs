@@ -3,8 +3,9 @@ name = "nrf70-sys"
 version = "0.1.0"
 edition = "2024"
 links = "nrf70_system"
-license = "BSD-3-Clause"
+license = "BSD-3-Clause AND Apache-2.0 AND LicenseRef-Nordic-5-Clause"
 description = "Private nRF70 system-mode FMAC C binding"
+repository.workspace = true
 publish = false
 
 [features]

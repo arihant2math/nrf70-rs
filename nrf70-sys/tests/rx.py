@@ -1,6 +1,6 @@
 """Exercise generated RX validation with production facade nbuf operations.
 
-Run after building: python3 nrf70-rs/nrf70-sys/tests/rx.py /path/to/out/rx_checked.c
+Run after building: python3 nrf70-sys/tests/rx.py /path/to/out/rx_checked.c
 Uses host ASan/UBSan, fake HAL packet copies/refills and a consuming RX callback.
 Only the configured STA data path is enabled; no hardware is accessed.
 """
@@ -14,7 +14,7 @@ import tempfile
 
 
 ROOT = Path(__file__).resolve().parent.parent
-VENDOR = ROOT.parent.parent / "third_party/nrf70-bm/nrf_wifi/fw_if/umac_if"
+VENDOR = ROOT / "vendor/nrf70-bm/nrf_wifi/fw_if/umac_if"
 
 
 def function(source, name):

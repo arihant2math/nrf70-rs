@@ -1,6 +1,6 @@
 """Compile and test the production next-deadline logic without the firmware.
 
-Run: python3 nrf70-rs/nrf70-sys/tests/deadline.py
+Run: python3 nrf70-sys/tests/deadline.py
 
 The driver task sleeps for as long as nrf70_facade_next_deadline_us allows, so
 a source it overlooks stalls the driver and one it reports forever spins it.

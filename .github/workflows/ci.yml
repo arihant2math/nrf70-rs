@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  ci:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Clang 21
+        run: |
+          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 21
+          echo /usr/lib/llvm-21/bin >> "$GITHUB_PATH"
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --locked -- -D warnings
+      - name: Host tests (mock backend)
+        run: |
+          host="$(rustc -vV | awk '/^host:/ {print $2}')"
+          cargo clippy --workspace --all-targets --locked --target "$host" \
+            --features nrf70/mock -- -D warnings
+          cargo test --workspace --locked --target "$host" --features nrf70/mock
+      # Exercise production C parsing and the generated patches, not just the
+      # deterministic facade_mock backend.
+      - name: C tests
+        run: |
+          python3 nrf70-sys/tests/rsn.py
+          python3 nrf70-sys/tests/deadline.py
+          python3 nrf70-sys/tests/tx_lifetime.py
+          out="$(dirname "$(find target/thumbv8m.main-none-eabihf/debug/build \
+            -name hal_interrupt_bounded.c | head -1)")"
+          python3 nrf70-sys/tests/irq_slice.py "$out/hal_interrupt_bounded.c"
+          python3 nrf70-sys/tests/rx.py "$out/rx_checked.c"

@@ -1,6 +1,6 @@
 """Test production TX buffer ownership/counters against synchronous and queued FMAC.
 
-Run: python3 nrf70-rs/nrf70-sys/tests/tx_lifetime.py
+Run: python3 nrf70-sys/tests/tx_lifetime.py
 Uses ASan/UBSan; no radio, firmware, or credentials are needed.
 """
 

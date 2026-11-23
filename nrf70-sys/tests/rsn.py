@@ -1,6 +1,6 @@
 """Compile and test the production RSN parser without the mock firmware.
 
-Run: python3 nrf70-rs/nrf70-sys/tests/rsn.py
+Run: python3 nrf70-sys/tests/rsn.py
 Only AP capability data is used; no passwords or keys.
 """
 

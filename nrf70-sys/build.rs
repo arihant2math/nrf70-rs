@@ -10,10 +10,6 @@ const TARGET: &str = "thumbv8m.main-none-eabihf";
 const CLANG_MAJOR_VERSION: &str = "21";
 const BLOB_SHA256: &str = "36b84d10037a9609a2a0fe86a0ef5b53fcd5fc2e88621c6d8f0f711b76775b1e";
 const LICENSE_SHA256: &str = "47d92141c69e74a0166c319a41e5005ce2b87f0498e5dbd5a0c5a34f9ef63954";
-const NRF70_BM_REV: &str = "185ec021afb61dc2d42b4f65800c3aa3d27c88d6";
-const NRF_WIFI_REV: &str = "0aaa9aa812877cb6bc020df8260d0607a3f0ec1a";
-const NRFXLIB_REV: &str = "f1591c62b301c2dc8d91308d43903de563f64d81";
-const HOSTAP_REV: &str = "d467a115b8fc20b8b7120937cb1d445dacebc6a1";
 /// zephyr `drivers/wifi/nrf_wifi/inc/coex_struct.h`, vendored verbatim; the
 /// commit is in vendor-manifest.toml.
 const COEX_STRUCT_SHA256: &str = "de3107a4f32f351ec990be3e6e3c386d8e7ffba99f9eaea4f3cff3d5ca3cf6b5";
@@ -589,19 +585,6 @@ fn hash(path: &Path) -> String {
         Sha256::digest(fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display())))
     )
 }
-fn require_revision(path: &Path, expected: &str) {
-    let out = Command::new("git")
-        .args(["-C", path.to_str().unwrap(), "rev-parse", "HEAD"])
-        .output()
-        .expect("git is required to verify pinned nRF70 sources");
-    let got = String::from_utf8(out.stdout).unwrap();
-    assert!(
-        out.status.success() && got.trim() == expected,
-        "pinned revision mismatch at {}: expected {expected}, got {}",
-        path.display(),
-        got.trim()
-    );
-}
 
 /// Fails unless every symbol either archive leaves undefined is defined by
 /// the other (facade.c and supplicant.c depend on each other).
@@ -723,6 +706,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src/supplicant.h");
     println!("cargo:rerun-if-changed=vendor");
     let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+    let vendor = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap()).join("vendor");
     let mock = env::var_os("CARGO_FEATURE_MOCK").is_some();
     assert!(
         mock || env::var("TARGET").unwrap() == TARGET,
@@ -744,10 +728,7 @@ fn main() {
         build.file("src/facade_mock.c");
         build.compile("nrf70_system");
     } else {
-        let root = PathBuf::from("../../third_party/nrf70-bm").canonicalize().expect("missing pinned third_party/nrf70-bm submodule; run git submodule update --init --recursive");
-        require_revision(&root, NRF70_BM_REV);
-        require_revision(&root.join("nrf_wifi"), NRF_WIFI_REV);
-        require_revision(&root.join("sdk-nrfxlib"), NRFXLIB_REV);
+        let root = vendor.join("nrf70-bm");
         let clang = Command::new("clang")
             .arg("--version")
             .output()
@@ -786,7 +767,7 @@ fn main() {
             }
         }
         build.file("src/facade.c");
-        let coex = PathBuf::from("vendor/zephyr_nrf_wifi");
+        let coex = vendor.join("zephyr_nrf_wifi");
         assert_eq!(
             hash(&coex.join("coex_struct.h")),
             COEX_STRUCT_SHA256,
@@ -808,10 +789,7 @@ fn main() {
         // Second archive: the hostap WPA2-PSK subset plus supplicant.c, which
         // needs the same defines and shim headers. facade.c never sees hostap
         // headers.
-        let hostap = PathBuf::from("../../third_party/hostap").canonicalize().expect(
-            "missing pinned third_party/hostap submodule; run git submodule update --init --recursive",
-        );
-        require_revision(&hostap, HOSTAP_REV);
+        let hostap = vendor.join("hostap");
         let shim = out.join("hostap_shim");
         for (name, contents) in HOSTAP_SHIM_HEADERS {
             let p = shim.join(name);

@@ -1,3 +1,5 @@
+# Upstream revisions of the sources in vendor/. Regenerate vendor/nrf70-bm
+# and vendor/hostap with vendor.sh after changing a commit.
 schema = 1
 target = "thumbv8m.main-none-eabihf"
 cpu = "cortex-m33"
@@ -39,7 +41,7 @@ subset = "separate-antenna PTA and non-PTA tables and the hardware reset; shared
 [nrfxlib]
 url = "https://github.com/nrfconnect/sdk-nrfxlib.git"
 commit = "f1591c62b301c2dc8d91308d43903de563f64d81"
-license_file = "third_party/nrf70-bm/sdk-nrfxlib/LICENSE"
+license_file = "vendor/nrf70-bm/sdk-nrfxlib/LICENSE"
 
 [firmware]
 path = "sdk-nrfxlib/nrf_wifi/bin/zephyr/default/nrf70.bin"
