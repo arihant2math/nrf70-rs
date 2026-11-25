@@ -9,7 +9,8 @@ embassy-net data plane and a WPA2-Personal supplicant.
   5-Clause license; see
   [`nrf70-sys/THIRD_PARTY_NOTICES.md`](nrf70-sys/THIRD_PARTY_NOTICES.md).
 
-Building for `thumbv8m.main-none-eabihf` needs Clang 21 on `PATH`. Host tests:
+Building for `thumbv8m.main-none-eabihf` needs `clang` on `PATH` and
+libclang for bindgen (set `LIBCLANG_PATH` if it is not found). Host tests:
 
 ```sh
 cargo test --workspace --target "$(rustc -vV | awk '/^host:/ {print $2}')" --features nrf70/mock

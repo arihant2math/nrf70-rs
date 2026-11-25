@@ -1,5 +1,2 @@
 [build]
 target = "thumbv8m.main-none-eabihf"
-
-# nrf70-sys needs Clang 21 on PATH, e.g. on macOS:
-# export PATH="/opt/homebrew/opt/llvm@21/bin:$PATH"

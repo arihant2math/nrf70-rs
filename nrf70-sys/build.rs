@@ -7,7 +7,6 @@ use std::{
 };
 
 const TARGET: &str = "thumbv8m.main-none-eabihf";
-const CLANG_MAJOR_VERSION: &str = "21";
 const BLOB_SHA256: &str = "36b84d10037a9609a2a0fe86a0ef5b53fcd5fc2e88621c6d8f0f711b76775b1e";
 const LICENSE_SHA256: &str = "47d92141c69e74a0166c319a41e5005ce2b87f0498e5dbd5a0c5a34f9ef63954";
 /// zephyr `drivers/wifi/nrf_wifi/inc/coex_struct.h`, vendored verbatim; the
@@ -729,16 +728,6 @@ fn main() {
         build.compile("nrf70_system");
     } else {
         let root = vendor.join("nrf70-bm");
-        let clang = Command::new("clang")
-            .arg("--version")
-            .output()
-            .expect("pinned Clang 21 is required");
-        let version = String::from_utf8_lossy(&clang.stdout);
-        let version = version.lines().next().unwrap_or("unknown");
-        assert!(
-            version.contains(&format!("{CLANG_MAJOR_VERSION}.")),
-            "Clang {CLANG_MAJOR_VERSION} is pinned, found: {version}"
-        );
         let fw = root.join("sdk-nrfxlib/nrf_wifi/bin/zephyr/default/nrf70.bin");
         let lic = root.join("sdk-nrfxlib/LICENSE");
         assert_eq!(hash(&fw), BLOB_SHA256, "firmware hash mismatch");
